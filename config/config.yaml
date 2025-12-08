@@ -1,0 +1,114 @@
+# XAIDroid Configuration File
+# All hyperparameters and paths for reproducibility
+
+# Dataset Paths
+paths:
+  raw_apks: "data/raw"
+  processed_data: "data/processed"
+  graphs: "data/graphs"
+  sensitive_apis: "config/sensitive_apis.json"
+  models: "models/checkpoints"
+  results: "results"
+  logs: "logs"
+
+# Preprocessing Settings
+preprocessing:
+  apk_tool_path: "/usr/local/bin/apktool"  # Or null for Androguard
+  use_androguard: true
+  min_methods: 5  # Filter out apps with too few methods
+  max_methods: 10000  # Filter out extremely large apps
+  parallel_workers: 8
+
+# Sensitive API Configuration
+sensitive_apis:
+  count: 688
+  sources:
+    - "axplorer"  # PScout-derived APIs
+    - "custom"    # Additional security-critical APIs
+  categories:
+    - "NETWORK"
+    - "SMS"
+    - "PHONE"
+    - "LOCATION"
+    - "CAMERA"
+    - "MICROPHONE"
+    - "CONTACTS"
+    - "STORAGE"
+    - "SYSTEM"
+    - "CRYPTO"
+
+# Graph Construction
+graph:
+  node_features:
+    - "api_type"  # One-hot encoded API category
+    - "parameter_count"
+    - "is_sensitive"
+    - "call_frequency"
+  edge_types:
+    - "direct_call"  # Method A directly calls Method B
+    - "indirect_call"  # Through intermediate methods
+  merge_strategy: "union"  # Combine all method CFGs
+  max_nodes: 5000  # Limit graph size
+  max_edges: 20000
+
+# GAT Model Configuration
+gat:
+  num_heads: 8
+  hidden_units: 8
+  dropout: 0.6
+  learning_rate: 0.0005
+  weight_decay: 0.0005
+  epochs: 200
+  batch_size: 32
+  early_stopping_patience: 20
+  attention_dropout: 0.6
+
+# GAM Model Configuration  
+gam:
+  population_size: 10  # Number of agents
+  step_size: 40        # Training steps per generation
+  num_generations: 50  # Total epochs = 50
+  mutation_rate: 0.1
+  crossover_rate: 0.7
+  tournament_size: 3
+  elitism: 2  # Keep top 2 agents
+
+# Explainability Thresholds (from paper)
+explainability:
+  method_threshold: 0.0001  # τ_method
+  class_threshold: 0.001    # τ_class
+  min_malicious_methods: 1  # At least 1 method must be flagged
+  ensemble_rule: "AND"      # GAM ∧ GAT (both must agree)
+
+# Training Configuration
+training:
+  train_split: 0.7
+  val_split: 0.15
+  test_split: 0.15
+  random_seed: 42
+  device: "cuda"  # or "cpu"
+  mixed_precision: true
+  gradient_clip: 1.0
+
+# Evaluation Metrics
+metrics:
+  - "accuracy"
+  - "precision"
+  - "recall"
+  - "f1_score"
+  - "auc_roc"
+  - "confusion_matrix"
+
+# Logging
+logging:
+  level: "INFO"
+  console: true
+  file: true
+  tensorboard: true
+  wandb: false  # Optional: Weights & Biases integration
+
+# Reproducibility
+reproducibility:
+  seed: 42
+  deterministic: true
+  benchmark: false  # Set true for speed, false for reproducibility

@@ -1,0 +1,36 @@
+# Python cache
+__pycache__/
+*.pyc
+*.vs/
+
+# Virtual environments
+venv/
+env/
+
+# Datasets (raw + processed)
+data/raw/*
+data/graphs/*
+data/reports/*
+
+# Model weights
+*.pt
+*.pth
+*.pkl
+
+# APK files
+*.apk
+*.apkm
+*.zip
+*.rar
+*.7z
+*.torrent
+
+# Logs
+logs/*
+
+# Temporary files
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db

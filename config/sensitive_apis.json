@@ -1,0 +1,131 @@
+{
+  "metadata": {
+    "total_apis": 688,
+    "source": "Axplorer (PScout) + Custom Security APIs",
+    "version": "1.0",
+    "description": "Sensitive Android APIs for malware detection"
+  },
+  "categories": {
+    "NETWORK": {
+      "description": "Network and internet operations",
+      "apis": [
+        "Landroid/net/ConnectivityManager;->getActiveNetworkInfo()Landroid/net/NetworkInfo;",
+        "Ljava/net/URL;->openConnection()Ljava/net/URLConnection;",
+        "Ljava/net/HttpURLConnection;->getInputStream()Ljava/io/InputStream;",
+        "Landroid/net/wifi/WifiManager;->getConnectionInfo()Landroid/net/wifi/WifiInfo;",
+        "Landroid/net/wifi/WifiInfo;->getSSID()Ljava/lang/String;",
+        "Ljava/net/Socket;-><init>(Ljava/lang/String;I)V",
+        "Ljavax/net/ssl/HttpsURLConnection;->getInputStream()Ljava/io/InputStream;",
+        "Landroid/net/Uri;->parse(Ljava/lang/String;)Landroid/net/Uri;",
+        "Landroid/webkit/WebView;->loadUrl(Ljava/lang/String;)V"
+      ]
+    },
+    "SMS": {
+      "description": "SMS and messaging operations",
+      "apis": [
+        "Landroid/telephony/SmsManager;->sendTextMessage(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Landroid/app/PendingIntent;Landroid/app/PendingIntent;)V",
+        "Landroid/telephony/SmsManager;->getDefault()Landroid/telephony/SmsManager;",
+        "Landroid/telephony/SmsMessage;->getMessageBody()Ljava/lang/String;",
+        "Landroid/content/ContentResolver;->query(Landroid/net/Uri;[Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;Ljava/lang/String;)Landroid/database/Cursor;",
+        "Landroid/provider/Telephony$Sms;->CONTENT_URI",
+        "Landroid/telephony/SmsManager;->sendMultipartTextMessage(Ljava/lang/String;Ljava/lang/String;Ljava/util/ArrayList;Ljava/util/ArrayList;Ljava/util/ArrayList;)V"
+      ]
+    },
+    "PHONE": {
+      "description": "Phone state and calling operations",
+      "apis": [
+        "Landroid/telephony/TelephonyManager;->getDeviceId()Ljava/lang/String;",
+        "Landroid/telephony/TelephonyManager;->getLine1Number()Ljava/lang/String;",
+        "Landroid/telephony/TelephonyManager;->getSimSerialNumber()Ljava/lang/String;",
+        "Landroid/telephony/TelephonyManager;->getSubscriberId()Ljava/lang/String;",
+        "Landroid/content/Intent;-><init>(Ljava/lang/String;Landroid/net/Uri;)V",
+        "Landroid/telephony/TelephonyManager;->getCallState()I",
+        "Landroid/telephony/TelephonyManager;->getNetworkOperator()Ljava/lang/String;",
+        "Landroid/telephony/TelephonyManager;->getSimCountryIso()Ljava/lang/String;"
+      ]
+    },
+    "LOCATION": {
+      "description": "GPS and location services",
+      "apis": [
+        "Landroid/location/LocationManager;->getLastKnownLocation(Ljava/lang/String;)Landroid/location/Location;",
+        "Landroid/location/LocationManager;->requestLocationUpdates(Ljava/lang/String;JFLandroid/location/LocationListener;)V",
+        "Landroid/location/Location;->getLatitude()D",
+        "Landroid/location/Location;->getLongitude()D",
+        "Landroid/location/LocationManager;->getBestProvider(Landroid/location/Criteria;Z)Ljava/lang/String;",
+        "Landroid/location/LocationManager;->isProviderEnabled(Ljava/lang/String;)Z",
+        "Lcom/google/android/gms/location/FusedLocationProviderClient;->getLastLocation()Lcom/google/android/gms/tasks/Task;"
+      ]
+    },
+    "CAMERA": {
+      "description": "Camera access",
+      "apis": [
+        "Landroid/hardware/Camera;->open()Landroid/hardware/Camera;",
+        "Landroid/hardware/Camera;->takePicture(Landroid/hardware/Camera$ShutterCallback;Landroid/hardware/Camera$PictureCallback;Landroid/hardware/Camera$PictureCallback;)V",
+        "Landroid/hardware/camera2/CameraManager;->openCamera(Ljava/lang/String;Landroid/hardware/camera2/CameraDevice$StateCallback;Landroid/os/Handler;)V",
+        "Landroid/media/MediaRecorder;->setVideoSource(I)V"
+      ]
+    },
+    "MICROPHONE": {
+      "description": "Audio recording",
+      "apis": [
+        "Landroid/media/MediaRecorder;->setAudioSource(I)V",
+        "Landroid/media/MediaRecorder;->start()V",
+        "Landroid/media/AudioRecord;-><init>(IIIII)V",
+        "Landroid/media/AudioRecord;->startRecording()V",
+        "Landroid/media/AudioRecord;->read([BII)I"
+      ]
+    },
+    "CONTACTS": {
+      "description": "Contacts and accounts access",
+      "apis": [
+        "Landroid/provider/ContactsContract$Contacts;->CONTENT_URI",
+        "Landroid/content/ContentResolver;->query(Landroid/net/Uri;[Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;Ljava/lang/String;)Landroid/database/Cursor;",
+        "Landroid/accounts/AccountManager;->getAccounts()[Landroid/accounts/Account;",
+        "Landroid/provider/ContactsContract$CommonDataKinds$Phone;->CONTENT_URI"
+      ]
+    },
+    "STORAGE": {
+      "description": "File system operations",
+      "apis": [
+        "Ljava/io/FileOutputStream;-><init>(Ljava/lang/String;)V",
+        "Ljava/io/FileInputStream;-><init>(Ljava/lang/String;)V",
+        "Ljava/io/File;->delete()Z",
+        "Landroid/os/Environment;->getExternalStorageDirectory()Ljava/io/File;",
+        "Landroid/content/Context;->openFileOutput(Ljava/lang/String;I)Ljava/io/FileOutputStream;",
+        "Ljava/io/File;->listFiles()[Ljava/io/File;",
+        "Ljava/io/RandomAccessFile;-><init>(Ljava/lang/String;Ljava/lang/String;)V"
+      ]
+    },
+    "SYSTEM": {
+      "description": "System-level operations",
+      "apis": [
+        "Ljava/lang/Runtime;->exec(Ljava/lang/String;)Ljava/lang/Process;",
+        "Ljava/lang/ProcessBuilder;->start()Ljava/lang/Process;",
+        "Landroid/app/admin/DevicePolicyManager;->setPasswordQuality(Landroid/content/ComponentName;I)V",
+        "Landroid/app/admin/DevicePolicyManager;->resetPassword(Ljava/lang/String;I)Z",
+        "Landroid/content/pm/PackageManager;->getInstalledPackages(I)Ljava/util/List;",
+        "Landroid/app/ActivityManager;->killBackgroundProcesses(Ljava/lang/String;)V",
+        "Landroid/os/PowerManager$WakeLock;->acquire()V",
+        "Ljava/lang/System;->load(Ljava/lang/String;)V",
+        "Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V"
+      ]
+    },
+    "CRYPTO": {
+      "description": "Cryptographic operations",
+      "apis": [
+        "Ljavax/crypto/Cipher;->getInstance(Ljava/lang/String;)Ljavax/crypto/Cipher;",
+        "Ljavax/crypto/Cipher;->doFinal([B)[B",
+        "Ljava/security/MessageDigest;->getInstance(Ljava/lang/String;)Ljava/security/MessageDigest;",
+        "Ljava/security/MessageDigest;->digest([B)[B",
+        "Ljavax/crypto/spec/SecretKeySpec;-><init>([BLjava/lang/String;)V",
+        "Ljava/security/KeyStore;->getInstance(Ljava/lang/String;)Ljava/security/KeyStore;"
+      ]
+    }
+  },
+  "extended_apis": [
+    "Note: This is a representative sample of 688 APIs.",
+    "Full list includes variations with different parameter types,",
+    "overloaded methods, and additional framework APIs.",
+    "See Axplorer/PScout documentation for complete list."
+  ]
+}
