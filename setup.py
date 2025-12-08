@@ -1,35 +1,74 @@
+"""Setup script for AIDroid-x package
+This version:
+ - Uses the distribution name "AIDroid-x"
+ - Dynamically finds packages under src/
+ - Builds package_data mapping programmatically (uses the primary package if present)
+ - Builds safe console_scripts entry_points only if a package is found (assumes scripts live in <package>.scripts)
+ - Keeps legacy behavior for README and requirements reading
 """
-Setup script for XAIDroid package
-"""
-
 from setuptools import setup, find_packages
 from pathlib import Path
+from typing import List, Dict
+
+HERE = Path(__file__).parent
 
 # Read README
-readme_path = Path(__file__).parent / "README.md"
+readme_path = HERE / "README.md"
 long_description = ""
 if readme_path.exists():
-    with open(readme_path, 'r', encoding='utf-8') as f:
-        long_description = f.read()
+    long_description = readme_path.read_text(encoding="utf-8")
 
 # Read requirements
-requirements_path = Path(__file__).parent / "requirements.txt"
-requirements = []
+requirements_path = HERE / "requirements.txt"
+requirements: List[str] = []
 if requirements_path.exists():
-    with open(requirements_path, 'r') as f:
-        requirements = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+    requirements = [
+        line.strip()
+        for line in requirements_path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+
+# Discover packages under src/
+packages = find_packages(where="src")
+package_dir = {"": "src"}
+
+# Determine a primary package to attach package_data and console scripts.
+# Prefer 'xaidroid' if present, otherwise first discovered package.
+primary_pkg = None
+if "xaidroid" in packages:
+    primary_pkg = "xaidroid"
+elif packages:
+    primary_pkg = packages[0]
+
+# Configure package_data: include config files if package exists
+package_data: Dict[str, List[str]] = {}
+if primary_pkg:
+    package_data = {
+        primary_pkg: ["config/*.yaml", "config/*.yml", "config/*.json"]
+    }
+
+# Configure console_scripts entry points if we can resolve package-based scripts.
+# Note: For these entry points to work, move the existing top-level scripts into
+# src/<primary_pkg>/scripts/ and expose a main() in each script module.
+console_scripts = []
+if primary_pkg:
+    console_scripts = [
+        "xaidroid-preprocess={pkg}.scripts.preprocess_apks:main".format(pkg=primary_pkg),
+        "xaidroid-train-gat={pkg}.scripts.train_gat:main".format(pkg=primary_pkg),
+        "xaidroid-train-gam={pkg}.scripts.train_gam:main".format(pkg=primary_pkg),
+        "xaidroid-inference={pkg}.scripts.inference:main".format(pkg=primary_pkg),
+        "xaidroid-evaluate={pkg}.scripts.evaluate:main".format(pkg=primary_pkg),
+        "xaidroid-visualize={pkg}.scripts.visualize_attention:main".format(pkg=primary_pkg),
+    ]
 
 setup(
-    name="AIdroid",
-    version="1.0.0",
-    author="AIDroid Team",
-    author_email="xaidroid@example.com",
+    name="AIDroid-x",
     description="Explainable Android Malware Detection using Graph Attention Networks",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/rigzen45/aidroid",
-    packages=find_packages(where="src"),
-    package_dir={"": "src"},
+    url="https://github.com/Rigzen-45/AIDroid-x",
+    packages=packages,
+    package_dir=package_dir,
     classifiers=[
         "Development Status :: 4 - Beta",
         "Intended Audience :: Developers",
@@ -57,22 +96,8 @@ setup(
             "dash>=2.10.0",
         ],
     },
-    entry_points={
-        "console_scripts": [
-            "xaidroid-preprocess=scripts.preprocess_apks:main",
-            "xaidroid-train-gat=scripts.train_gat:main",
-            "xaidroid-train-gam=scripts.train_gam:main",
-            "xaidroid-inference=scripts.inference:main",
-            "xaidroid-evaluate=scripts.evaluate:main",
-            "xaidroid-visualize=scripts.visualize_attention:main",
-        ],
-    },
+    entry_points={"console_scripts": console_scripts} if console_scripts else {},
     include_package_data=True,
-    package_data={
-        "xaidroid": [
-            "config/*.yaml",
-            "config/*.json",
-        ],
-    },
+    package_data=package_data,
     zip_safe=False,
 )
