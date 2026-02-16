@@ -325,6 +325,7 @@ class SmaliParser:
         }
 
 
+"""
 # Example usage
 if __name__ == "__main__":
     logging.basicConfig(
@@ -333,7 +334,7 @@ if __name__ == "__main__":
     )
     
     # Test with sample Smali code
-    sample_smali = """
+    sample_smali = """""""
 .class public Lcom/example/MainActivity;
 .super Landroid/app/Activity;
 
@@ -362,7 +363,7 @@ if __name__ == "__main__":
     
     return-object v0
 .end method
-""".strip().split('\n')
+"""""".strip().split('\n')
     
     parser = SmaliParser()
     smali_class = parser.parse_lines(sample_smali)
@@ -382,3 +383,4 @@ if __name__ == "__main__":
         print(f"\nStatistics:")
         for key, value in stats.items():
             print(f"  {key}: {value}")
+"""
