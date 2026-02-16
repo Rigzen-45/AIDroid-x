@@ -25,14 +25,33 @@ import tempfile
 import shutil
 import zipfile
 import re
+import subprocess
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
+
 
 from androguard.core.bytecodes.apk import APK
 from androguard.core.bytecodes.dvm import DalvikVMFormat
 from androguard.core.analysis.analysis import Analysis
 
+
 logger = logging.getLogger(__name__)
+
+
+def run_apktool(apk_path: Path, out_dir: Path):
+    try:
+        if out_dir.exists():
+            shutil.rmtree(out_dir)
+        subprocess.run(
+            ["apktool", "d", "-f", str(apk_path), "-o", str(out_dir)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"apktool failed on {apk_path.name}: {e}")
+        return False
 
 
 def _is_zip(path: Path) -> bool:
@@ -40,6 +59,8 @@ def _is_zip(path: Path) -> bool:
         return zipfile.is_zipfile(path)
     except Exception:
         return False
+
+
 
 
 def _extract_base_apk_from_archive(path: Path) -> Optional[Path]:
@@ -52,6 +73,7 @@ def _extract_base_apk_from_archive(path: Path) -> Optional[Path]:
         if not _is_zip(path):
             return None
 
+
         tmpdir = Path(tempfile.mkdtemp(prefix="xaidroid_apk_"))
         with zipfile.ZipFile(path, "r") as z:
             members = z.namelist()
@@ -59,6 +81,7 @@ def _extract_base_apk_from_archive(path: Path) -> Optional[Path]:
             if not apk_members:
                 shutil.rmtree(tmpdir, ignore_errors=True)
                 return None
+
 
             chosen = None
             if "base.apk" in members:
@@ -76,14 +99,18 @@ def _extract_base_apk_from_archive(path: Path) -> Optional[Path]:
                         largest_size = info.file_size
                 chosen = largest
 
+
             out_path = tmpdir / "extracted_base.apk"
             with z.open(chosen) as src, open(out_path, "wb") as dst:
                 shutil.copyfileobj(src, dst)
+
 
             return out_path
     except Exception as e:
         logger.debug(f"Archive extraction failed for {path.name}: {e}", exc_info=True)
         return None
+
+
 
 
 def _safe_get_dex_blobs(apk_obj: APK, apk_file_path: Path) -> List[Tuple[str, bytes]]:
@@ -94,6 +121,7 @@ def _safe_get_dex_blobs(apk_obj: APK, apk_file_path: Path) -> List[Tuple[str, by
     - Filter out invalid/too-small entries
     """
     dex_items: List[Tuple[str, bytes]] = []
+
 
     # 1) Androguard getters (get_all_dex / get_dex)
     for getter in ("get_all_dex", "get_dex"):
@@ -116,6 +144,7 @@ def _safe_get_dex_blobs(apk_obj: APK, apk_file_path: Path) -> List[Tuple[str, by
                 logger.debug(f"Error while calling {getter} on APK object", exc_info=True)
                 continue
 
+
     # 2) Manual scan of zip entries for embedded .dex / .jar
     try:
         with zipfile.ZipFile(apk_file_path, 'r') as z:
@@ -133,6 +162,7 @@ def _safe_get_dex_blobs(apk_obj: APK, apk_file_path: Path) -> List[Tuple[str, by
     except Exception:
         logger.debug("Failed to open APK as zip for embedded file scan", exc_info=True)
 
+
     # Remove duplicates by name keeping first occurrence
     seen: Set[str] = set()
     unique: List[Tuple[str, bytes]] = []
@@ -141,11 +171,14 @@ def _safe_get_dex_blobs(apk_obj: APK, apk_file_path: Path) -> List[Tuple[str, by
             seen.add(name)
             unique.append((name, data))
 
+
     return unique
 
 
+
+
 class APKDecompiler:
-    def __init__(self, output_dir: str = "data/processed"):
+    def __init__(self, output_dir: str = "data/processed/smali"):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         # regex to find invoke-* style called signatures in smali output
@@ -156,10 +189,12 @@ class APKDecompiler:
         # pattern for System.loadLibrary or Class.forName usage in smali
         self._forname_regex = re.compile(r'Ljava/lang/Class;->forName|Ljava/lang/reflect/Method;->invoke|System->loadLibrary')
 
+
     def decompile(self, apk_path: str) -> Dict:
         apk_path = Path(apk_path)
         apk_name = apk_path.name
         logger.info(f"Decompiling APK: {apk_name}")
+
 
         extracted_tmp = None
         try:
@@ -174,6 +209,18 @@ class APKDecompiler:
             logger.warning(f"Failed to extract from archive {apk_name}: {e}")
             apk_to_use = apk_path
 
+
+        # === APKTOOL DECOMPILATION (VISIBLE SMALI) ===
+        apktool_out = self.output_dir / Path(apk_name).stem
+        apktool_ok = run_apktool(apk_to_use, apktool_out)
+
+        if apktool_ok:
+            logger.info(f"Smali dumped to: {apktool_out}")
+        else:
+            logger.warning("Smali dump failed (continuing with androguard only)")
+
+
+
         try:
             # Basic zip validity
             try:
@@ -182,17 +229,20 @@ class APKDecompiler:
             except Exception:
                 return {"success": False, "error": "Failed to validate APK file"}
 
+
             # Load via androguard
             try:
                 apk_obj = APK(str(apk_to_use))
             except Exception as e:
                 return {"success": False, "error": f"Androguard APK load failed: {e}"}
 
+
             # Validate manifest
             try:
                 manifest_bytes = apk_obj.get_android_manifest_xml()
             except Exception:
                 manifest_bytes = None
+
 
             if not manifest_bytes:
                 # keep trying — sometimes the manifest is accessible via APK api but empty; we still allow but warn
@@ -202,10 +252,12 @@ class APKDecompiler:
             else:
                 manifest_ok = True
 
+
             try:
                 pkg = apk_obj.get_package()
             except Exception:
                 pkg = None
+
 
             # Collect embedded files info (so, dex, jars)
             embedded_files = []
@@ -221,6 +273,7 @@ class APKDecompiler:
             except Exception:
                 logger.debug("Failed to enumerate embedded files", exc_info=True)
 
+
             # Get dex blobs (name, bytes)
             dex_items = _safe_get_dex_blobs(apk_obj, apk_to_use)
             if not dex_items:
@@ -228,6 +281,7 @@ class APKDecompiler:
                 msg = "No DEX files found"
                 logger.warning(f"{apk_name}: {msg}")
                 return {"success": False, "error": msg}
+
 
             # Build DalvikVMFormat objects, guard corrupt blobs
             dalvik_objs = []
@@ -238,8 +292,10 @@ class APKDecompiler:
                 except Exception as e:
                     logger.debug(f"Skipping corrupt dex blob {name} in {apk_name}: {e}", exc_info=True)
 
+
             if not dalvik_objs:
                 return {"success": False, "error": "All DEX blobs invalid or corrupt"}
+
 
             # Analysis aggregator
             analysis = Analysis()
@@ -252,6 +308,7 @@ class APKDecompiler:
                 analysis.create_xref()
             except Exception:
                 logger.debug(f"create_xref failed for {apk_name}", exc_info=True)
+
 
             # Prepare result
             result = {
@@ -268,13 +325,37 @@ class APKDecompiler:
                 "manifest_ok": manifest_ok
             }
 
+
             # Walk each dex and extract
             for dex_name, d in dalvik_objs:
                 self._extract_methods(d, analysis, result, dex_name)
 
+
             logger.info(f"Decompiled {apk_name}: {len(result['methods'])} methods, {len(result['classes'])} classes, embedded_files={len(embedded_files)}, native_libs={len(native_libs)}")
 
+            # ===============================
+            # Persist smali-like output to disk
+            # ===============================
+
+            apk_out_dir = self.output_dir / apk_name
+            smali_dir = apk_out_dir / "smali"
+            smali_dir.mkdir(parents=True, exist_ok=True)
+
+            for method_name, lines in result["smali_code"].items():
+                # sanitize filename
+                safe_name = re.sub(r'[^a-zA-Z0-9_.-]', '_', method_name)
+                out_file = smali_dir / f"{safe_name}.smali"
+
+                try:
+                    with open(out_file, "w", encoding="utf-8") as f:
+                        for l in lines:
+                            f.write(l + "\n")
+                except Exception:
+                    pass
+
+
             return result
+
 
         except Exception as e:
             logger.error(f"Unhandled error while decompiling {apk_name}: {e}", exc_info=True)
@@ -286,6 +367,7 @@ class APKDecompiler:
                 except Exception:
                     pass
 
+
     def _extract_methods(self, dex: DalvikVMFormat, analysis: Analysis, result: Dict, dex_name: str) -> None:
         """
         Populate result dict with methods/classes/smali/api_calls for a single DalvikVMFormat.
@@ -296,22 +378,27 @@ class APKDecompiler:
             logger.debug("dex.get_classes() failed; skipping this dex", exc_info=True)
             return
 
+
         for cls in classes:
             try:
                 class_name = cls.get_name()
             except Exception:
                 continue
 
+
             if self._is_framework_class(class_name):
                 continue
 
+
             if class_name not in result["classes"]:
                 result["classes"][class_name] = []
+
 
             try:
                 methods = cls.get_methods()
             except Exception:
                 methods = []
+
 
             for method in methods:
                 try:
@@ -320,6 +407,7 @@ class APKDecompiler:
                     full_name = f"{class_name}->{method_name}{method_desc}"
                 except Exception:
                     continue
+
 
                 info = {
                     "name": full_name,
@@ -330,10 +418,12 @@ class APKDecompiler:
                     "dex": dex_name
                 }
 
+
                 try:
                     info["access_flags"] = method.get_access_flags_string()
                 except Exception:
                     info["access_flags"] = None
+
 
                 # safe code size
                 try:
@@ -353,8 +443,10 @@ class APKDecompiler:
                 except Exception:
                     info["code_size"] = 0
 
+
                 result["methods"].append(info)
                 result["classes"][class_name].append(full_name)
+
 
                 # smali-like extraction
                 try:
@@ -362,6 +454,7 @@ class APKDecompiler:
                     result["smali_code"][full_name] = smali_lines
                 except Exception:
                     result["smali_code"][full_name] = []
+
 
                 # api calls extraction: first try xref, fallback to smali parsing
                 try:
@@ -378,6 +471,7 @@ class APKDecompiler:
                         result["reflection_evidence"].setdefault(full_name, []).extend(reflection_notes)
                 except Exception:
                     result["api_calls"][full_name] = []
+
 
     def _extract_smali_code(self, method) -> List[str]:
         lines = []
@@ -397,6 +491,7 @@ class APKDecompiler:
             pass
         return lines
 
+
     def _extract_api_calls(self, method, analysis: Analysis, smali_lines: List[str]) -> Tuple[List[str], List[str]]:
         """
         Extract API calls for a method. Strategy:
@@ -409,12 +504,14 @@ class APKDecompiler:
         api_calls: List[str] = []
         reflection_notes: List[str] = []
 
+
         # 1) XREF-based extraction (preferred)
         x_method = None
         try:
             x_method = analysis.get_method(method)
         except Exception:
             x_method = None
+
 
         if x_method:
             try:
@@ -430,6 +527,7 @@ class APKDecompiler:
                 # If xref iteration fails, we'll fallback
                 pass
 
+
         # 2) Fallback: parse smali lines for invoke patterns
         if not api_calls and smali_lines:
             for line in smali_lines:
@@ -441,10 +539,12 @@ class APKDecompiler:
                     except Exception:
                         continue
 
+
                 # Also capture calls like 'invoke-static {v0}, Ljava/lang/Class;->forName(Ljava/lang/String;)Ljava/lang/Class;'
                 if 'forName' in line or 'Ljava/lang/reflect/Method' in line or 'System->loadLibrary' in line:
                     # mark reflection/jni evidence
                     reflection_notes.append(f"pattern:{line.strip()}")
+
 
         # 3) Additional heuristic: reconstruct reflective call targets using nearby const-strings
         # Look for sequences: const-string "com.example.BadClass" ... invoke-static ... forName ... invoke-virtual getMethod/invoke
@@ -454,6 +554,7 @@ class APKDecompiler:
             cs = self._const_string_regex.search(sline)
             if cs:
                 const_strings.append(cs.group(1))
+
 
         if const_strings:
             # attempt to correlate forName/getMethod/invoke occurrences
@@ -476,6 +577,7 @@ class APKDecompiler:
                             if 'invoke(' in later or 'Ljava/lang/reflect/Method;->invoke' in later:
                                 reflection_notes.append(f"Method.invoke detected -> runtime execution of {found_classname}")
 
+
         # 4) Native/JNI detection
         try:
             acc = method.get_access_flags_string() if hasattr(method, 'get_access_flags_string') else None
@@ -484,6 +586,7 @@ class APKDecompiler:
         except Exception:
             pass
 
+
         # 5) In-method detection for System.loadLibrary or JNI patterns in smali
         for line in smali_lines:
             if 'System.loadLibrary' in line or 'Ljava/lang/System;->loadLibrary' in line:
@@ -491,7 +594,9 @@ class APKDecompiler:
             if 'JNI_OnLoad' in line:
                 reflection_notes.append("JNI_OnLoad detected")
 
+
         return api_calls, reflection_notes
+
 
     def _is_framework_class(self, cls_name: str) -> bool:
         if not cls_name:
