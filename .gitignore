@@ -11,6 +11,7 @@ env/
 data/raw/*
 data/graphs/*
 data/reports/*
+data/intermediate/*
 
 # Model weights
 *.pt
