@@ -6,13 +6,17 @@ Upgraded API Extractor and Sensitive API Filter for XAIDroid
 - No external dependencies (pure stdlib + same JSON sensitive db)
 """
 
+
 import json
 import logging
 from pathlib import Path
 from typing import Dict, List, Set, Tuple, Optional, Any
 import math
 
+
 logger = logging.getLogger(__name__)
+
+
 
 
 class SensitiveAPIFilter:
@@ -30,8 +34,10 @@ class SensitiveAPIFilter:
         self.category_to_id = {}
         self.aggressive_matching = aggressive_matching
 
+
         self._load_sensitive_apis()
         logger.info(f"SensitiveAPIFilter loaded {len(self.sensitive_apis)} APIs across {len(self.categories)} categories")
+
 
     # --------------------------
     # Loading & helpers
@@ -52,6 +58,7 @@ class SensitiveAPIFilter:
                 self.sensitive_apis.add(norm_api)
                 self.api_to_category[norm_api] = cname
 
+
     def _normalize_sig(self, api_call: str) -> str:
         """
         Normalize API signature to canonical smali-like form:
@@ -66,12 +73,14 @@ class SensitiveAPIFilter:
             return ""
         s = api_call.strip()
 
+
         # if dot-style like android.telephony.TelephonyManager.getDeviceId -> convert
         if "->" not in s and "." in s:
             parts = s.split(".")
             cls = "L" + "/".join(parts[:-1]) + ";"
             method = parts[-1] + "()"
             s = f"{cls}->{method}"
+
 
         # If contains '->' and parameters and return types, keep up to closing ')'
         if "->" in s:
@@ -89,6 +98,7 @@ class SensitiveAPIFilter:
         s = s.replace(" )", ")")
         return s
 
+
     def _split_class_method(self, api_call: str) -> Tuple[str, str]:
         """
         Return (class, method_name)
@@ -101,6 +111,7 @@ class SensitiveAPIFilter:
         cls, method = normalized.split("->", 1)
         method_name = method.split("(")[0]
         return cls, method_name
+
 
     def _method_similarity(self, a: str, b: str) -> float:
         """
@@ -128,6 +139,7 @@ class SensitiveAPIFilter:
         lcs = dp[0][0]
         return lcs / max(la, lb)
 
+
     def _class_suffix_match(self, class_a: str, class_b: str) -> bool:
         """
         Match classes by suffix tokens. Useful when packages are shaded/relocated.
@@ -147,6 +159,7 @@ class SensitiveAPIFilter:
             return True
         return False
 
+
     # --------------------------
     # Matching logic
     # --------------------------
@@ -156,6 +169,7 @@ class SensitiveAPIFilter:
             return norm
         return None
 
+
     def _match_class_level(self, api_call: str) -> Optional[str]:
         cls, _ = self._split_class_method(api_call)
         for sens in self.sensitive_apis:
@@ -163,6 +177,7 @@ class SensitiveAPIFilter:
             if cls == scls or self._class_suffix_match(cls, scls):
                 return sens
         return None
+
 
     def _match_method_only(self, api_call: str, threshold: float = 0.95) -> Optional[str]:
         _, m = self._split_class_method(api_call)
@@ -184,6 +199,7 @@ class SensitiveAPIFilter:
             return best
         return None
 
+
     def is_sensitive(self, api_call: str) -> bool:
         """
         Determine whether the api_call is sensitive using layered matching.
@@ -191,16 +207,19 @@ class SensitiveAPIFilter:
         if not api_call:
             return False
 
+
         # 1. exact normalized match
         exact = self._match_exact(api_call)
         if exact:
             return True
+
 
         # 2. class-level match (telephony.*, sms.*, location.*)
         cls_match = self._match_class_level(api_call)
         if cls_match:
             # treat as sensitive, but prefer exact if available
             return True
+
 
         # 3. method-only match
         method_match = self._match_method_only(api_call)
@@ -213,6 +232,7 @@ class SensitiveAPIFilter:
                                           method_match.split("->")[-1].split("(")[0])
             return sim >= 0.95
 
+
         # 4. fallback fuzzy: compare tokens
         # compare last token of class + method similarity
         try:
@@ -224,7 +244,9 @@ class SensitiveAPIFilter:
         except Exception:
             pass
 
+
         return False
+
 
     # --------------------------
     # Reflection mapping
@@ -251,6 +273,7 @@ class SensitiveAPIFilter:
                     continue
         return results
 
+
     # --------------------------
     # Main filter - accepts either:
     #  - method_api_calls: { method -> [api_sig, ...] }
@@ -259,6 +282,7 @@ class SensitiveAPIFilter:
     def filter_api_calls(self, input_data: Any) -> Dict:
         """
         input_data: either method_api_calls dict or decompiler result dict.
+
 
         Returns filtered_data as:
             {
@@ -283,6 +307,7 @@ class SensitiveAPIFilter:
             # assume a plain mapping was passed
             method_api_calls = input_data or {}
 
+
         # initialize stats
         filtered_data = {
             "methods": {},  # method -> list of sensitive APIs
@@ -293,11 +318,13 @@ class SensitiveAPIFilter:
             "total_filtered": 0
         }
 
+
         for method_name, api_calls in method_api_calls.items():
             if not isinstance(api_calls, (list, tuple)):
                 continue
             sensitive_calls: List[str] = []
             filtered_data["total_filtered"] += len(api_calls)
+
 
             # normalize and check each api call
             for raw_call in api_calls:
@@ -319,6 +346,7 @@ class SensitiveAPIFilter:
                     if cat in filtered_data["category_stats"]:
                         filtered_data["category_stats"][cat] += 1
 
+
             # Add reflection-derived hits for this method if any
             refl_notes = reflection_map.get(method_name, []) if reflection_map else []
             refl_candidates = self.extract_reflection_sensitive(refl_notes)
@@ -337,11 +365,14 @@ class SensitiveAPIFilter:
                             filtered_data["category_stats"][cat] += 1
                 filtered_data["reflection_hits"][method_name] = refl_candidates
 
+
             if sensitive_calls:
                 filtered_data["methods"][method_name] = sensitive_calls
 
+
         logger.info(f"Filtered {filtered_data['total_sensitive']} sensitive APIs from {filtered_data['total_filtered']} total calls in {len(filtered_data['methods'])} methods")
         return filtered_data
+
 
     # --------------------------
     # Utility functions
@@ -350,8 +381,10 @@ class SensitiveAPIFilter:
         norm = self._normalize_sig(api_call)
         return self.api_to_category.get(norm, "UNKNOWN")
 
+
     def get_category_id(self, category: str) -> int:
         return self.category_to_id.get(category, -1)
+
 
     def get_category_distribution(self, filtered_data: Dict) -> Dict[str, float]:
         total = filtered_data.get("total_sensitive", 0)
@@ -359,39 +392,9 @@ class SensitiveAPIFilter:
             return {cat: 0.0 for cat in self.categories}
         return {cat: (count / total) * 100.0 for cat, count in filtered_data.get("category_stats", {}).items()}
 
+
     def get_most_common_apis(self, filtered_data: Dict, top_k: int = 10) -> List[Tuple[str, int, str]]:
         api_list = [(api, stats["count"], stats["category"]) for api, stats in filtered_data.get("api_stats", {}).items()]
         api_list.sort(key=lambda x: x[1], reverse=True)
         return api_list[:top_k]
 
-"""
-# Example usage (if run directly)
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-    filt = SensitiveAPIFilter(sensitive_api_path="config/sensitive_apis.json", aggressive_matching=False)
-
-    
-    # Example: decompiler result path (the PDF you uploaded is at /mnt/data/COMPLETE WORKFLOW.pdf if you need to reference it)
-    # Suppose `decompiler_result` is loaded from your APKDecompiler.decompile()
-    decompiler_result_example = {
-        "methods": [],
-        "api_calls": {
-            "Lcom/example/MainActivity;->onCreate()V": [
-                "Landroid/telephony/TelephonyManager;->getDeviceId()Ljava/lang/String;",
-                "Landroid/location/LocationManager;->getLastKnownLocation(Ljava/lang/String;)Landroid/location/Location;"
-            ],
-            "Lcom/obf/a;->a()V": [
-                "La/a/a/a;->b()V"  # obfuscated - will be matched by method/class heuristics if possible
-            ]
-        },
-        "reflection_evidence": {
-            "Lcom/obf/a;->a()V": ["forName detected -> class='android.telephony.SmsManager'"]
-        }
-    }
-    
-
-    filtered = filt.filter_api_calls(decompiler_result_example) 
-    print("Total sensitive:", filtered["total_sensitive"])
-    print("Category distribution:", filt.get_category_distribution(filtered))
-    print("Top APIs:", filt.get_most_common_apis(filtered, top_k=10))
-    """
