@@ -1,6 +1,7 @@
 """
 Upgraded APICallGraphBuilder (compatible with upgraded SensitiveAPIFilter)
 
+
 Features:
 - Uses filtered API data when available (sensitive-only)
 - Uses api_filter.create_api_features(api) to populate API node metadata
@@ -11,27 +12,35 @@ Features:
 - Defensive logging and per-apk stats support
 """
 
+
 import logging
 import json
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 from collections import defaultdict
+import matplotlib.pyplot as plt
+
 
 import networkx as nx
+
 
 logger = logging.getLogger(__name__)
 
 
+
+
 class APICallGraphBuilder:
-    def __init__(self, api_filter, reports_dir: str = "data/reports"):
-        """
-        Args:
-            api_filter: instance of upgraded SensitiveAPIFilter (expects create_api_features())
-            reports_dir: directory to write per-apk graph reports for debugging
-        """
+    def __init__(self, api_filter, reports_dir="data/reports", viz_dir="data/graphs"):
         self.api_filter = api_filter
         self.reports_dir = Path(reports_dir)
+        self.viz_dir = Path(viz_dir)
+
+
         self.reports_dir.mkdir(parents=True, exist_ok=True)
+        self.viz_dir.mkdir(parents=True, exist_ok=True)
+
+
+
 
     # -------------------------------------------------------------------------
     # Public API
@@ -39,6 +48,7 @@ class APICallGraphBuilder:
     def build_graph(self, decompiled_data: Dict[str, Any]) -> nx.DiGraph:
         """
         Build a directed API-call graph from decompiled APK data.
+
 
         decompiled_data expected keys:
           - methods: list of method dicts (name, class, access_flags, code_size, dex)
@@ -49,12 +59,15 @@ class APICallGraphBuilder:
           - filtered_apis: optional: result of SensitiveAPIFilter.filter_api_calls(decompiled_result)
         """
 
+
         apk_name = decompiled_data.get("apk_name", "unknown")
         graph = nx.DiGraph()
+
 
         if not decompiled_data.get("success", False):
             logger.error(f"[{apk_name}] decompilation unsuccessful - skipping graph build")
             return graph
+
 
         methods = decompiled_data.get("methods", []) or []
         api_calls = decompiled_data.get("api_calls", {}) or {}
@@ -63,10 +76,13 @@ class APICallGraphBuilder:
         method_calls = decompiled_data.get("method_calls", {}) or {}
         filtered = decompiled_data.get("filtered_apis") or decompiled_data.get("filtered_data") or {}
 
+
         logger.info(f"[{apk_name}] Building graph: methods={len(methods)}, classes={len(classes)}")
+
 
         # 1) Add method nodes
         self._add_method_nodes(graph, methods, api_calls)
+
 
         # 2) Add API nodes (prefer filtered data)
         if filtered and filtered.get("api_stats"):
@@ -74,11 +90,13 @@ class APICallGraphBuilder:
         else:
             self._add_api_nodes(graph, api_calls)
 
+
         # 3) Add method -> api edges
         if filtered and filtered.get("methods"):
             self._add_call_edges_from_filtered(graph, filtered)
         else:
             self._add_call_edges(graph, api_calls)
+
 
         # 4) Add method -> method edges (prefer method_calls from decompiler)
         if method_calls:
@@ -86,11 +104,14 @@ class APICallGraphBuilder:
         else:
             self._add_method_to_method_edges_heuristic(graph, api_calls)
 
+
         # 5) Add reflection nodes & edges
         self._add_reflection_nodes_and_edges(graph, reflection)
 
+
         # 6) graph metadata
         self._add_graph_metadata(graph, decompiled_data)
+
 
         # 7) prune to sensitive neighborhood
         pruned = self._prune_graph(graph)
@@ -108,9 +129,60 @@ class APICallGraphBuilder:
         except Exception:
             logger.debug(f"[{apk_name}] failed to write report", exc_info=True)
 
+
         logger.info(f"[{apk_name}] Graph built: nodes={pruned.number_of_nodes()} edges={pruned.number_of_edges()}")
         return pruned
+   
+    def _visualize_graph(self, graph: nx.DiGraph, apk_name: str):
 
+
+        if graph.number_of_nodes() == 0:
+            logger.warning("Empty graph — skipping visualization")
+            return
+
+
+        plt.figure(figsize=(12, 10))
+
+
+        pos = nx.spring_layout(graph, k=0.8, seed=42)
+
+
+        colors = []
+        for n, d in graph.nodes(data=True):
+            if d["type"] == "api":
+                colors.append("red")
+            elif d["type"] == "reflection":
+                colors.append("orange")
+            else:
+                colors.append("skyblue")
+
+
+        nx.draw(
+            graph,
+            pos,
+            node_color=colors,
+            node_size=120,
+            edge_color="gray",
+            with_labels=False,
+            alpha=0.85
+        )
+
+
+        plt.title(f"Sensitive API Call Graph: {apk_name}")
+        plt.tight_layout()
+
+
+        out = self.viz_dir / f"{apk_name}_graph.png"
+        plt.savefig(out, dpi=300)
+        plt.close()
+
+
+        logger.info(f"Graph visualization saved → {out}")
+
+
+
+
+   
     # -------------------------------------------------------------------------
     # Node helpers
     # -------------------------------------------------------------------------
@@ -133,6 +205,7 @@ class APICallGraphBuilder:
                 has_sensitive_api=(sens_count > 0)
             )
 
+
     def _add_api_nodes(self, graph: nx.DiGraph, api_calls: Dict[str, List[str]]) -> None:
         all_apis = set()
         for lst in api_calls.values():
@@ -154,6 +227,7 @@ class APICallGraphBuilder:
                     category = "UNKNOWN"
                 category_id = abs(hash(category)) % 10000
 
+
             graph.add_node(
                 api,
                 type="api",
@@ -164,6 +238,7 @@ class APICallGraphBuilder:
                 api_count=0,
                 sensitive_api_count=0
             )
+
 
     def _add_api_nodes_from_filtered(self, graph: nx.DiGraph, filtered: Dict[str, Any]) -> None:
         api_stats = filtered.get("api_stats", {}) or {}
@@ -182,6 +257,7 @@ class APICallGraphBuilder:
                 sensitive_api_count=0
             )
 
+
     # -------------------------------------------------------------------------
     # Edges: method -> api
     # -------------------------------------------------------------------------
@@ -198,6 +274,7 @@ class APICallGraphBuilder:
                         graph.nodes[caller]["sensitive_api_count"] = graph.nodes[caller].get("sensitive_api_count", 0) + 1
                         graph.nodes[caller]["has_sensitive_api"] = True
 
+
     def _add_call_edges_from_filtered(self, graph: nx.DiGraph, filtered: Dict[str, Any]) -> None:
         methods_map = filtered.get("methods", {}) or {}
         for method, apis in methods_map.items():
@@ -210,6 +287,7 @@ class APICallGraphBuilder:
                     graph.nodes[method]["sensitive_api_count"] = graph.nodes[method].get("sensitive_api_count", 0) + 1
                     graph.nodes[method]["has_sensitive_api"] = True
 
+
     # -------------------------------------------------------------------------
     # Method->method edges: prefer real method_calls from decompiler
     # -------------------------------------------------------------------------
@@ -221,12 +299,14 @@ class APICallGraphBuilder:
                 if callee in graph:
                     graph.add_edge(caller, callee, call_type="method_call", is_sensitive_call=False)
 
+
     def _add_method_to_method_edges_heuristic(self, graph: nx.DiGraph, api_calls: Dict[str, List[str]]) -> None:
         # build class -> methods
         class_map = defaultdict(list)
         for node, data in graph.nodes(data=True):
             if data.get("type") == "method":
                 class_map[data.get("class_name", "")].append(node)
+
 
         # connect methods in small classes conservatively
         for cls, methods in class_map.items():
@@ -239,6 +319,7 @@ class APICallGraphBuilder:
                 succ2 = {n for n in graph.successors(m2) if graph.nodes[n].get("type") == "api"}
                 if succ1 and succ2 and (succ1 & succ2):
                     graph.add_edge(m1, m2, call_type="inferred", is_sensitive_call=False)
+
 
     # -------------------------------------------------------------------------
     # Reflection handling
@@ -267,6 +348,7 @@ class APICallGraphBuilder:
                 except Exception:
                     continue
 
+
     # -------------------------------------------------------------------------
     # Metadata, pruning, stats
     # -------------------------------------------------------------------------
@@ -277,9 +359,15 @@ class APICallGraphBuilder:
         graph.graph["num_methods"] = len(data.get("methods", []))
         graph.graph["num_classes"] = len(data.get("classes", {}))
 
+
+
+
+
+
     def _prune_graph(self, graph: nx.DiGraph, keep_unconnected: bool = False) -> nx.DiGraph:
         if graph.number_of_nodes() == 0:
             return graph
+
 
         sensitive_nodes = {
             n for n, d in graph.nodes(data=True)
@@ -288,14 +376,17 @@ class APICallGraphBuilder:
                or d.get("type") == "reflection"
         }
 
+
         if not sensitive_nodes:
             logger.warning("No sensitive nodes found in graph; returning original graph")
             return graph
+
 
         keep = set(sensitive_nodes)
         for n in list(sensitive_nodes):
             keep.update(graph.predecessors(n))
             keep.update(graph.successors(n))
+
 
         pruned = graph.subgraph(keep).copy()
         if not keep_unconnected:
@@ -304,6 +395,9 @@ class APICallGraphBuilder:
                 pruned.remove_nodes_from(isolated)
         logger.debug(f"Pruned graph: {graph.number_of_nodes()} -> {pruned.number_of_nodes()}")
         return pruned
+
+
+
 
     def get_graph_statistics(self, graph: nx.DiGraph) -> Dict[str, Any]:
         stats = {
@@ -317,3 +411,6 @@ class APICallGraphBuilder:
             "num_components": nx.number_weakly_connected_components(graph) if graph.number_of_nodes() > 0 else 0
         }
         return stats
+
+
+
