@@ -402,25 +402,36 @@ def mixup_data(x, y, alpha=1.0):
 def warmup_lr_scheduler(optimizer, warmup_epochs, initial_lr, target_lr):
     """
     Create learning rate warmup scheduler.
-    
+
     Args:
-        optimizer: PyTorch optimizer
+        optimizer: PyTorch optimizer (must be initialised with base_lr = target_lr)
         warmup_epochs: Number of warmup epochs
-        initial_lr: Starting learning rate
+        initial_lr: Starting learning rate (before warmup)
         target_lr: Target learning rate after warmup
-        
+
     Returns:
-        Scheduler function
+        LambdaLR scheduler
     """
+    # FIX: LambdaLR multiplies the optimizer's base_lr by the value returned
+    # from lr_lambda().  The original code returned an ABSOLUTE lr value
+    # (e.g. 1.5e-4) which LambdaLR then multiplied by base_lr again, producing
+    # a wildly wrong effective lr (e.g. 4.5e-8 instead of 1.5e-4).
+    # Correct fix: return a RATIO = desired_lr / base_lr so that
+    #   actual_lr = base_lr * ratio = desired_lr  ✓
+    # Assumes optimizer is initialised with base_lr = target_lr.
     def lr_lambda(epoch):
+        if target_lr == 0:
+            return 1.0  # avoid division by zero; no warmup effect
         if epoch < warmup_epochs:
-            return initial_lr + (target_lr - initial_lr) * epoch / warmup_epochs
+            desired_lr = initial_lr + (target_lr - initial_lr) * epoch / max(warmup_epochs, 1)
         else:
-            return target_lr
-    
+            desired_lr = target_lr
+        return desired_lr / target_lr  # ratio relative to base_lr
+
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
+"""
 # Example usage
 if __name__ == "__main__":
     logging.basicConfig(
@@ -459,3 +470,4 @@ if __name__ == "__main__":
     print(f"\nBest validation accuracy: {tracker.get_best('val_acc')}")
     
     print("\n✅ All utilities working correctly!")
+"""
