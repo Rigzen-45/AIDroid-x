@@ -75,37 +75,42 @@ def _extract_base_apk_from_archive(path: Path) -> Optional[Path]:
 
 
         tmpdir = Path(tempfile.mkdtemp(prefix="xaidroid_apk_"))
-        with zipfile.ZipFile(path, "r") as z:
-            members = z.namelist()
-            apk_members = [m for m in members if m.lower().endswith(".apk")]
-            if not apk_members:
-                shutil.rmtree(tmpdir, ignore_errors=True)
-                return None
+        try:
+            with zipfile.ZipFile(path, "r") as z:
+                members = z.namelist()
+                apk_members = [m for m in members if m.lower().endswith(".apk")]
+                if not apk_members:
+                    shutil.rmtree(tmpdir, ignore_errors=True)
+                    return None
 
 
-            chosen = None
-            if "base.apk" in members:
-                chosen = "base.apk"
-            elif len(apk_members) == 1:
-                chosen = apk_members[0]
-            else:
-                # pick largest .apk inside
-                largest = None
-                largest_size = -1
-                for m in apk_members:
-                    info = z.getinfo(m)
-                    if info.file_size > largest_size:
-                        largest = m
-                        largest_size = info.file_size
-                chosen = largest
+                chosen = None
+                if "base.apk" in members:
+                    chosen = "base.apk"
+                elif len(apk_members) == 1:
+                    chosen = apk_members[0]
+                else:
+                    # pick largest .apk inside
+                    largest = None
+                    largest_size = -1
+                    for m in apk_members:
+                        info = z.getinfo(m)
+                        if info.file_size > largest_size:
+                            largest = m
+                            largest_size = info.file_size
+                    chosen = largest
 
 
-            out_path = tmpdir / "extracted_base.apk"
-            with z.open(chosen) as src, open(out_path, "wb") as dst:
-                shutil.copyfileobj(src, dst)
+                out_path = tmpdir / "extracted_base.apk"
+                with z.open(chosen) as src, open(out_path, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
 
 
-            return out_path
+                return out_path
+        except Exception:
+            # FIX: clean up tmpdir if extraction fails after it was created
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            raise
     except Exception as e:
         logger.debug(f"Archive extraction failed for {path.name}: {e}", exc_info=True)
         return None
@@ -146,10 +151,30 @@ def _safe_get_dex_blobs(apk_obj: APK, apk_file_path: Path) -> List[Tuple[str, by
 
 
     # 2) Manual scan of zip entries for embedded .dex / .jar
+    # FIX: androguard getters (step 1) name dex blobs classes1.dex, classes2.dex, ...
+    # while the actual zip entries are named classes.dex, classes2.dex, ...
+    # "classes.dex" != "classes1.dex" so the dedup-by-name check below misses
+    # the duplicate and a single-dex APK gets parsed twice.
+    # Track the actual zip names of blobs already loaded via androguard to skip them.
+    already_loaded_zip_names: Set[str] = set()
     try:
         with zipfile.ZipFile(apk_file_path, 'r') as z:
+            zip_dex_names = [
+                info.filename for info in z.infolist()
+                if info.filename.lower().endswith(".dex") or info.filename.lower().endswith(".jar")
+            ]
+            # Map androguard-assigned names (classes1.dex, classes2.dex, ...) back to
+            # actual zip names (classes.dex, classes2.dex, ...) by position.
+            # Androguard returns dex blobs in the same order as the zip entries.
+            actual_dex_names = [n for n in zip_dex_names if n.lower().endswith(".dex")]
+            for i, (assigned_name, _) in enumerate(dex_items):
+                if i < len(actual_dex_names):
+                    already_loaded_zip_names.add(actual_dex_names[i])
+
             for info in z.infolist():
                 nm = info.filename
+                if nm in already_loaded_zip_names:
+                    continue  # already loaded via androguard getter; skip to avoid double-parse
                 if nm.lower().endswith(".dex") or nm.lower().endswith(".jar"):
                     try:
                         with z.open(nm) as f:
@@ -603,6 +628,9 @@ class APKDecompiler:
             return False
         prefixes = (
             "Landroid/", "Ljava/", "Ljavax/", "Ldalvik/",
-            "Lorg/apache/", "Lorg/json/", "Lorg/xml/", "Lorg/w3c/"
+            "Lorg/apache/", "Lorg/json/", "Lorg/xml/", "Lorg/w3c/",
+            # Common third-party SDKs that add graph noise but carry no malware signal
+            "Lcom/google/", "Lcom/android/", "Lkotlin/", "Lkotlinx/",
+            "Lcom/squareup/", "Lcom/firebase/", "Lcom/facebook/",
         )
         return any(cls_name.startswith(p) for p in prefixes)
