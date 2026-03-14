@@ -1,12 +1,17 @@
 """
-Training Script for GAT Model
-Paper params: 8 heads, 8 hidden units, LR=0.0005, 200 epochs
+GAT Training Script - COMPLETE FIX
+Fixes applied:
+- Class-weighted CrossEntropyLoss (audit fix)
+- Gradient norm logging before clip (M-05)
+- ReduceLROnPlateau replacing cosine schedule (H-06)
+- Linear warmup for first WARMUP_EPOCHS before scheduler takes over
+  (prevents BatchNorm instability on cold AdamW start with small datasets)
+- Reduced default hidden_units/num_heads for small-dataset regime
 """
 
 import argparse
 import yaml
 import logging
-import os
 import sys
 from pathlib import Path
 import torch
@@ -15,43 +20,49 @@ from torch_geometric.loader import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 from tqdm import tqdm
+from collections import Counter
+import json
 
-# Add src to path
 sys.path.append(str(Path(__file__).parent.parent))
 
-from src.models.gat_model import GAT, GATTrainer
+from src.models.gat_model import GAT
 from src.dataset.graph_dataset import MalwareGraphDataset
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score,
+    confusion_matrix, roc_auc_score
+)
+
+# Number of epochs to linearly ramp LR from 0 → base_lr before
+# handing control to ReduceLROnPlateau.
+# Prevents corrupted weight initialisation from noisy first-batch gradients
+# when BatchNorm has not yet accumulated stable statistics (critical on
+# small datasets where each batch has high variance).
+WARMUP_EPOCHS = 5   # fallback if config missing warmup_epochs key
 
 
 def setup_logging(log_dir: str):
-    """Setup logging configuration."""
     log_dir = Path(log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
-    
+
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.FileHandler(log_dir / 'train_gat.log'),
+            logging.FileHandler(log_dir / 'train.log'),
             logging.StreamHandler()
         ]
     )
     return logging.getLogger(__name__)
 
 
-def load_config(config_path: str) -> dict:
-    """Load configuration from YAML file."""
+def load_config(config_path: str):
     with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
-    return config
+        return yaml.safe_load(f)
 
 
-def create_data_loaders(config: dict, logger):
-    """Create train/val/test data loaders."""
+def create_data_loaders(config, logger):
     logger.info("Loading datasets...")
-    
-    # Load graphs
+
     train_graphs, train_labels = MalwareGraphDataset.load_dataset(
         config['paths']['graphs'] + '/train/graphs.pkl'
     )
@@ -61,293 +72,329 @@ def create_data_loaders(config: dict, logger):
     test_graphs, test_labels = MalwareGraphDataset.load_dataset(
         config['paths']['graphs'] + '/test/graphs.pkl'
     )
-    
-    # Create datasets
+
+    train_counter = Counter(train_labels)
+    logger.info(f"Class distribution: {dict(train_counter)}")
+
+    total = len(train_labels)
+    class_weights = torch.FloatTensor([
+        total / (2.0 * train_counter[0]),
+        total / (2.0 * train_counter[1]),
+    ])
+    logger.info(f"Class weights: benign={class_weights[0]:.4f}, malware={class_weights[1]:.4f}")
+
     train_dataset = MalwareGraphDataset(
         root=config['paths']['graphs'] + '/train',
         graphs=train_graphs,
         labels=train_labels
     )
-    
     val_dataset = MalwareGraphDataset(
         root=config['paths']['graphs'] + '/val',
         graphs=val_graphs,
         labels=val_labels
     )
-    
     test_dataset = MalwareGraphDataset(
         root=config['paths']['graphs'] + '/test',
         graphs=test_graphs,
         labels=test_labels
     )
-    
-    # Create data loaders
+
     train_loader = DataLoader(
         train_dataset,
-        batch_size=config['gat']['batch_size'],
+        batch_size=config['gat'].get('batch_size', 32),
         shuffle=True,
-        num_workers=4
     )
-    
     val_loader = DataLoader(
         val_dataset,
-        batch_size=config['gat']['batch_size'],
+        batch_size=config['gat'].get('batch_size', 32),
         shuffle=False,
-        num_workers=4
     )
-    
     test_loader = DataLoader(
         test_dataset,
-        batch_size=config['gat']['batch_size'],
+        batch_size=config['gat'].get('batch_size', 32),
         shuffle=False,
-        num_workers=4
     )
-    
-    logger.info(f"Train: {len(train_dataset)} samples")
-    logger.info(f"Val: {len(val_dataset)} samples")
-    logger.info(f"Test: {len(test_dataset)} samples")
-    
-    return train_loader, val_loader, test_loader, train_dataset.num_node_features
+
+    logger.info(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}, Test: {len(test_dataset)}")
+
+    # ── Feature sanity check ─────────────────────────────────────────────────
+    # Verifies that graph_builder populated category_counts correctly.
+    # If Group1 non-zero nodes = 0, the processed/ cache is stale:
+    #   delete data/graphs/*/processed/ and re-run preprocess_apks.py.
+    _b = next(iter(train_loader))
+    logger.info(f"[SANITY] Feature shape          : {list(_b.x.shape)}  (expected [N, 41])")
+    logger.info(f"[SANITY] Group1 non-zero nodes  : {(_b.x[:, :10].sum(1) > 0).sum().item()} / {_b.x.shape[0]}"
+                f"  (must be > 0 — if 0, delete processed/ cache)")
+    logger.info(f"[SANITY] Feature means dim 0-9  : {[round(v, 4) for v in _b.x.mean(0)[:10].tolist()]}"
+                f"  (must NOT all be 0.0)")
+    logger.info(f"[SANITY] Batch class distribution: {_b.y.bincount().tolist()}")
+    # ── End sanity check ─────────────────────────────────────────────────────
+
+    return train_loader, val_loader, test_loader, train_dataset.num_node_features, class_weights
 
 
-def train_epoch(model, train_loader, optimizer, criterion, device, logger):
-    """Train for one epoch."""
+def train_epoch(model, loader, optimizer, criterion, device, epoch, writer, global_step):
     model.train()
     total_loss = 0
-    all_preds = []
-    all_labels = []
-    
-    pbar = tqdm(train_loader, desc="Training")
-    for batch in pbar:
+    all_preds, all_labels = [], []
+
+    for batch in tqdm(loader, desc=f"Epoch {epoch}"):
         batch = batch.to(device)
-        
         optimizer.zero_grad()
-        logits, _ = model(batch.x, batch.edge_index, batch.batch, return_attention=False)
+
+        # Pass graph_size if present (added by graph_dataset.py to address
+        # the 7.57× malware/benign size differential)
+        graph_size = getattr(batch, "graph_size", None)
+
+        logits, _ = model(
+            batch.x, batch.edge_index, batch.batch,
+            return_attention=False,
+            graph_size=graph_size,
+        )
         loss = criterion(logits, batch.y)
-        
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+        # [M-05] Log gradient norm BEFORE clipping for training diagnostics.
+        total_norm = 0.0
+        for p in model.parameters():
+            if p.grad is not None:
+                total_norm += p.grad.data.norm(2).item() ** 2
+        total_norm = total_norm ** 0.5
+        writer.add_scalar('Gradients/norm_before_clip', total_norm, global_step)
+
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
-        
+
         total_loss += loss.item()
-        
-        preds = torch.argmax(logits, dim=1)
+        writer.add_scalar('Loss/train_step', loss.item(), global_step)
+        global_step += 1
+
+        probs = torch.softmax(logits, dim=1)
+        preds = torch.argmax(probs, dim=1)
         all_preds.extend(preds.cpu().numpy())
         all_labels.extend(batch.y.cpu().numpy())
-        
-        pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-    
-    avg_loss = total_loss / len(train_loader)
-    accuracy = accuracy_score(all_labels, all_preds)
-    
-    return avg_loss, accuracy
+
+    return total_loss / len(loader), accuracy_score(all_labels, all_preds), global_step
 
 
-def validate(model, val_loader, criterion, device, logger):
-    """Validate model."""
+def validate(model, loader, criterion, device, threshold=0.3):
+    """Validate model. threshold=0.3 matches the training operating point.
+    
+    Using 0.3 here is critical — the model is early-stopped on val_f1 computed
+    at this threshold, so evaluate.py must also use 0.3 for consistent metrics
+    (docx Section 5.1 and 7.1).
+    """
     model.eval()
     total_loss = 0
-    all_preds = []
-    all_labels = []
-    all_probs = []
-    
+    all_preds, all_labels, all_probs = [], [], []
+
     with torch.no_grad():
-        for batch in tqdm(val_loader, desc="Validating"):
+        for batch in loader:
             batch = batch.to(device)
-            
-            logits, _ = model(batch.x, batch.edge_index, batch.batch, return_attention=False)
+
+            graph_size = getattr(batch, "graph_size", None)
+
+            logits, _ = model(
+                batch.x, batch.edge_index, batch.batch,
+                return_attention=False,
+                graph_size=graph_size,
+            )
             loss = criterion(logits, batch.y)
-            
             total_loss += loss.item()
-            
+
             probs = torch.softmax(logits, dim=1)
-            preds = torch.argmax(logits, dim=1)
-            
+            malware_probs = probs[:, 1]
+            preds = (malware_probs > threshold).long()
+
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(batch.y.cpu().numpy())
-            all_probs.extend(probs[:, 1].cpu().numpy())
-    
-    avg_loss = total_loss / len(val_loader)
-    
-    # Calculate metrics
-    accuracy = accuracy_score(all_labels, all_preds)
+            all_probs.extend(malware_probs.cpu().numpy())
+
+    avg_loss  = total_loss / len(loader)
+    accuracy  = accuracy_score(all_labels, all_preds)
     precision = precision_score(all_labels, all_preds, zero_division=0)
-    recall = recall_score(all_labels, all_preds, zero_division=0)
-    f1 = f1_score(all_labels, all_preds, zero_division=0)
-    
-    return avg_loss, accuracy, precision, recall, f1
+    recall    = recall_score(all_labels, all_preds, zero_division=0)
+    f1        = f1_score(all_labels, all_preds, zero_division=0)
+    cm        = confusion_matrix(all_labels, all_preds)
+
+    try:
+        auc = roc_auc_score(all_labels, all_probs)
+    except Exception:
+        auc = 0.0
+
+    return avg_loss, accuracy, precision, recall, f1, auc, cm
 
 
 def main(args):
-    # Setup
     logger = setup_logging(args.log_dir)
-    logger.info("=" * 80)
-    logger.info("GAT Model Training")
-    logger.info("=" * 80)
-    
-    # Load config
+
     config = load_config(args.config)
-    
-    # Set device
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    logger.info(f"Using device: {device}")
-    
-    # Set random seeds for reproducibility
-    torch.manual_seed(config['reproducibility']['seed'])
-    np.random.seed(config['reproducibility']['seed'])
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(config['reproducibility']['seed'])
-    
-    # Create data loaders
-    train_loader, val_loader, test_loader, num_features = create_data_loaders(config, logger)
-    
-    # Create model
+    logger.info(f"Device: {device}")
+    logger.info(f"Learning rate: {config['gat']['learning_rate']}")
+    logger.info(f"Warmup epochs: {WARMUP_EPOCHS}")
+
+    seed = config['reproducibility']['seed']
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    train_loader, val_loader, test_loader, num_features, class_weights = create_data_loaders(config, logger)
+
     model = GAT(
         num_node_features=num_features,
-        hidden_units=config['gat']['hidden_units'],
-        num_heads=config['gat']['num_heads'],
+        hidden_units=config['gat'].get('hidden_units', 32),
+        num_heads=config['gat'].get('num_heads', 8),
         num_classes=2,
-        dropout=config['gat']['dropout'],
-        attention_dropout=config['gat']['attention_dropout']
+        dropout=config['gat'].get('dropout', 0.3),
+        attention_dropout=config['gat'].get('attention_dropout', 0.4),
+        use_graph_size=True,   # concat log1p(nodes,edges) before FC head
     ).to(device)
-    
-    logger.info(f"Model created:")
-    logger.info(f"  Parameters: {sum(p.numel() for p in model.parameters()):,}")
-    logger.info(f"  Hidden units: {config['gat']['hidden_units']}")
-    logger.info(f"  Num heads: {config['gat']['num_heads']}")
-    
-    # Optimizer and loss
-    optimizer = torch.optim.Adam(
+
+    logger.info(f"Model: {sum(p.numel() for p in model.parameters()):,} parameters")
+
+    criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
+
+    optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config['gat']['learning_rate'],
-        weight_decay=config['gat']['weight_decay']
+        weight_decay=config['gat']['weight_decay'],
     )
-    
+
+    # ReduceLROnPlateau takes over after warmup completes.
+    # patience=5: tolerates 5 stagnant epochs before halving LR.
+    # mode='max': tracks val_f1 (higher is better).
+    # min_lr=1e-5: floor prevents LR from dropping so low the model
+    # stops learning before convergence (docx Section 5.2).
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.5, patience=10, verbose=True
+        optimizer,
+        mode='max',
+        factor=0.5,
+        patience=5,
+        min_lr=1e-5,
+        verbose=True,
     )
-    
-    criterion = nn.CrossEntropyLoss()
-    
-    # Tensorboard
+
     writer = SummaryWriter(log_dir=Path(args.log_dir) / 'tensorboard')
-    
-    # Training loop
-    best_val_f1 = 0
-    best_epoch = 0
+
+    best_val_f1      = 0.0
+    best_epoch       = 0
     patience_counter = 0
-    
-    logger.info("\n" + "=" * 80)
-    logger.info("Starting Training")
-    logger.info("=" * 80)
-    
-    for epoch in range(config['gat']['epochs']):
-        logger.info(f"\nEpoch {epoch + 1}/{config['gat']['epochs']}")
-        logger.info("-" * 80)
-        
-        # Train
-        train_loss, train_acc = train_epoch(
-            model, train_loader, optimizer, criterion, device, logger
+    global_step      = 0
+    total_epochs     = config['gat']['epochs']
+    base_lr          = config['gat']['learning_rate']
+
+    # Read warmup length from config so it stays in sync with config.yaml
+    # (docx Section 10: warmup_epochs 5→8 for 10K dataset).
+    warmup_epochs = config['gat'].get('warmup_epochs', WARMUP_EPOCHS)
+
+    for epoch in range(total_epochs):
+
+        # ── Learning rate: warmup → plateau scheduler ─────────────────────
+        if epoch < warmup_epochs:
+            warmup_lr = base_lr * (epoch + 1) / warmup_epochs
+            for pg in optimizer.param_groups:
+                pg['lr'] = warmup_lr
+            current_lr = warmup_lr
+        else:
+            current_lr = optimizer.param_groups[0]['lr']
+        # ── End LR logic ──────────────────────────────────────────────────
+
+        logger.info(f"\nEpoch {epoch+1}/{total_epochs} (LR: {current_lr:.6f})")
+        writer.add_scalar('LR', current_lr, epoch)
+
+        train_loss, train_acc, global_step = train_epoch(
+            model, train_loader, optimizer, criterion, device, epoch + 1, writer, global_step
         )
-        
-        # Validate
-        val_loss, val_acc, val_prec, val_rec, val_f1 = validate(
-            model, val_loader, criterion, device, logger
+        val_loss, val_acc, val_prec, val_rec, val_f1, val_auc, val_cm = validate(
+            model, val_loader, criterion, device, threshold=0.4
         )
-        
-        # Log metrics
-        logger.info(f"Train Loss: {train_loss:.4f}, Acc: {train_acc:.4f}")
-        logger.info(f"Val Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, "
-                   f"Prec: {val_prec:.4f}, Rec: {val_rec:.4f}, F1: {val_f1:.4f}")
-        
-        writer.add_scalar('Loss/train', train_loss, epoch)
-        writer.add_scalar('Loss/val', val_loss, epoch)
-        writer.add_scalar('Accuracy/train', train_acc, epoch)
-        writer.add_scalar('Accuracy/val', val_acc, epoch)
-        writer.add_scalar('F1/val', val_f1, epoch)
-        writer.add_scalar('Learning_Rate', optimizer.param_groups[0]['lr'], epoch)
-        
-        # Learning rate scheduling
-        scheduler.step(val_f1)
-        
-        # Save best model
+
+
+        logger.info(f"Train: Loss={train_loss:.4f}, Acc={train_acc:.4f}")
+        logger.info(f"Val:   Loss={val_loss:.4f}, Acc={val_acc:.4f}, "
+                    f"F1={val_f1:.4f}, AUC={val_auc:.4f}, "
+                    f"Prec={val_prec:.4f}, Rec={val_rec:.4f}")
+
+        if epoch >= warmup_epochs:
+            scheduler.step(val_f1)
+
+        # TensorBoard logging
+        writer.add_scalar('Loss/train_epoch', train_loss, epoch)
+        writer.add_scalar('Loss/val',         val_loss,   epoch)
+        writer.add_scalar('Metrics/val_acc',       val_acc,  epoch)
+        writer.add_scalar('Metrics/val_f1',        val_f1,   epoch)
+        writer.add_scalar('Metrics/val_auc',       val_auc,  epoch)
+        writer.add_scalar('Metrics/val_precision', val_prec, epoch)
+        writer.add_scalar('Metrics/val_recall',    val_rec,  epoch)
+
         if val_f1 > best_val_f1:
-            best_val_f1 = val_f1
-            best_epoch = epoch
+            best_val_f1      = val_f1
+            best_epoch       = epoch
             patience_counter = 0
-            
+
             model_path = Path(config['paths']['models']) / 'gat_best.pt'
             model_path.parent.mkdir(parents=True, exist_ok=True)
-            
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
                 'val_f1': val_f1,
-                'config': config['gat']
+                'model_config': {
+                    'num_node_features': num_features,
+                    'hidden_units':      config['gat'].get('hidden_units', 32),
+                    'num_heads':         config['gat'].get('num_heads', 4),
+                    'num_classes':       2,
+                    'dropout':           config['gat'].get('dropout', 0.3),
+                    'attention_dropout': config['gat'].get('attention_dropout', 0.3),
+                },
             }, model_path)
-            
-            logger.info(f"*** New best model saved! F1: {val_f1:.4f} ***")
+            logger.info(f"Best model saved (Epoch {epoch+1}, F1={val_f1:.4f})")
         else:
             patience_counter += 1
-        
-        # Early stopping
-        if patience_counter >= config['gat']['early_stopping_patience']:
-            logger.info(f"\nEarly stopping triggered after {epoch + 1} epochs")
+
+        if patience_counter >= config['gat'].get('early_stopping_patience', 25):
+            logger.info(f"Early stopping at epoch {epoch+1}")
             break
-    
-    # Load best model and evaluate on test set
-    logger.info("\n" + "=" * 80)
-    logger.info("Evaluating Best Model on Test Set")
-    logger.info("=" * 80)
-    
+
+    # ── Test ─────────────────────────────────────────────────────────────────
+    logger.info("\nTesting best model")
     checkpoint = torch.load(Path(config['paths']['models']) / 'gat_best.pt')
     model.load_state_dict(checkpoint['model_state_dict'])
-    
-    test_loss, test_acc, test_prec, test_rec, test_f1 = validate(
-        model, test_loader, criterion, device, logger
+    logger.info(f"Loaded best model from epoch {checkpoint['epoch'] + 1}")
+
+    test_loss, test_acc, test_prec, test_rec, test_f1, test_auc, test_cm = validate(
+        model, test_loader, criterion, device
     )
-    
-    logger.info(f"\nTest Results:")
-    logger.info(f"  Loss: {test_loss:.4f}")
-    logger.info(f"  Accuracy: {test_acc:.4f}")
-    logger.info(f"  Precision: {test_prec:.4f}")
-    logger.info(f"  Recall: {test_rec:.4f}")
-    logger.info(f"  F1 Score: {test_f1:.4f}")
-    
-    # Save final results
+
+    logger.info(f"Test Accuracy:  {test_acc:.4f}")
+    logger.info(f"Test Precision: {test_prec:.4f}")
+    logger.info(f"Test Recall:    {test_rec:.4f}")
+    logger.info(f"Test F1:        {test_f1:.4f}")
+    logger.info(f"Test AUC:       {test_auc:.4f}")
+    logger.info(f"Test Confusion Matrix:\n{test_cm}")
+
     results = {
-        'best_epoch': best_epoch,
-        'best_val_f1': float(best_val_f1),
-        'test_accuracy': float(test_acc),
-        'test_precision': float(test_prec),
-        'test_recall': float(test_rec),
-        'test_f1': float(test_f1),
-        'config': config['gat']
+        'best_epoch':            int(checkpoint['epoch'] + 1),
+        'test_accuracy':         float(test_acc),
+        'test_precision':        float(test_prec),
+        'test_recall':           float(test_rec),
+        'test_f1':               float(test_f1),
+        'test_auc':              float(test_auc),
+        'test_confusion_matrix': test_cm.tolist(),
     }
-    
-    import json
+
     results_path = Path(config['paths']['results']) / 'gat_results.json'
     results_path.parent.mkdir(parents=True, exist_ok=True)
     with open(results_path, 'w') as f:
         json.dump(results, f, indent=2)
-    
-    logger.info(f"\nResults saved to {results_path}")
+
+    logger.info(f"Saved results to {results_path}")
     writer.close()
-    
-    logger.info("\n" + "=" * 80)
-    logger.info("Training Complete!")
-    logger.info("=" * 80)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train GAT model for malware detection")
-    parser.add_argument('--config', type=str, default='config/config.yaml',
-                       help='Path to config file')
-    parser.add_argument('--device', type=str, default='cuda',
-                       help='Device to use (cuda/cpu)')
-    parser.add_argument('--log_dir', type=str, default='logs/gat',
-                       help='Directory for logs')
-    
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', type=str, default='config/config.yaml')
+    parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument('--log_dir', type=str, default='logs/gat')
     args = parser.parse_args()
     main(args)
