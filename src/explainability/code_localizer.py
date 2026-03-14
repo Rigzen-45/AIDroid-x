@@ -133,14 +133,27 @@ class CodeLocalizer:
         else:
             attention_array = np.array(node_attention)
         
+        # FIX: framework API prefixes — nodes with these prefixes are Android/Java
+        # leaf API nodes, not user code. Including them in malicious_methods produces
+        # false positives (e.g., Landroid/telephony/TelephonyManager;->getDeviceId()
+        # appearing as "malicious" when the real culprit is the method that calls it).
+        _FRAMEWORK_PREFIXES = (
+            "Landroid/", "Ljava/", "Ljavax/", "Ldalvik/",
+            "Lorg/apache/", "Lorg/json/", "Lorg/xml/", "Lorg/w3c/",
+            "Lcom/google/", "Lcom/android/", "Lkotlin/", "Lkotlinx/",
+            "REFLECTION::",
+        )
+
         for node_idx, node_name in enumerate(node_names):
             attention_score = float(attention_array[node_idx])
-            
-            # Extract method name (before -> for method nodes)
+
             if "->" in node_name:
-                # This is a method or API call
-                # For methods: use the full signature
-                # For APIs: attribute to the method that calls it (handled separately)
+                # Skip Android framework / Java stdlib / reflection stub nodes.
+                # These are api leaf nodes — the malicious signal lives in the
+                # user method node that CALLS them, not in the API itself.
+                if any(node_name.startswith(p) for p in _FRAMEWORK_PREFIXES):
+                    continue
+
                 method_name = node_name
                 method_scores[method_name] += attention_score
                 method_counts[method_name] += 1
@@ -540,56 +553,37 @@ class EnsembleLocalizer:
         
         combined_malicious_methods.sort(key=lambda x: x[1], reverse=True)
         
-        # Similar for classes
+        # Union of classes flagged by either model
         all_classes = set()
         all_classes.update(c[0] for c in gat_result["malicious_classes"])
         all_classes.update(c[0] for c in gam_result["malicious_classes"])
-        
-        # ... (similar aggregation for classes)
-        
+
+        combined_malicious_classes = []
+        for class_name in all_classes:
+            gat_class = next((c for c in gat_result["malicious_classes"] if c[0] == class_name), None)
+            gam_class = next((c for c in gam_result["malicious_classes"] if c[0] == class_name), None)
+
+            gat_score = gat_class[1] if gat_class else 0.0
+            gam_score = gam_class[1] if gam_class else 0.0
+            avg_score = (gat_score + gam_score) / 2
+
+            # Union of malicious methods from both models for this class
+            gat_methods = gat_class[2] if gat_class else []
+            gam_methods = gam_class[2] if gam_class else []
+            combined_methods = list(set(gat_methods + gam_methods))
+
+            combined_malicious_classes.append((class_name, avg_score, combined_methods))
+
+        combined_malicious_classes.sort(key=lambda x: x[1], reverse=True)
+
         return {
-            "method_scores": gat_result["method_scores"],
+            "method_scores": {
+                **gam_result["method_scores"],
+                **gat_result["method_scores"],  # GAT scores override for shared methods
+            },
             "malicious_methods": combined_malicious_methods,
-            "class_scores": gat_result["class_scores"],
-            "malicious_classes": [],  # Simplified for brevity
+            "class_scores": {**gam_result["class_scores"], **gat_result["class_scores"]},
+            "malicious_classes": combined_malicious_classes,
         }
 
 
-# Example usage
-if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-    
-    # Create test data
-    node_attention = torch.tensor([
-        0.0005, 0.0002, 0.0001, 0.0003, 0.0004,
-        0.00001, 0.00002, 0.000015, 0.00003, 0.00001
-    ])
-    
-    node_names = [
-        "Lcom/example/MainActivity;->onCreate()V",
-        "Lcom/example/MainActivity;->sendData()V",
-        "Lcom/example/NetworkService;->uploadData()V",
-        "Lcom/example/NetworkService;->connectToServer()V",
-        "Lcom/example/Utils;->encryptData([B)[B",
-        "Landroid/telephony/TelephonyManager;->getDeviceId()Ljava/lang/String;",
-        "Landroid/location/LocationManager;->getLastKnownLocation()Landroid/location/Location;",
-        "Ljava/net/HttpURLConnection;->getInputStream()Ljava/io/InputStream;",
-        "Landroid/telephony/SmsManager;->sendTextMessage()V",
-        "Ljava/lang/String;->toString()Ljava/lang/String;"
-    ]
-    
-    # Initialize localizer
-    localizer = CodeLocalizer(
-        method_threshold=0.0001,
-        class_threshold=0.001
-    )
-    
-    # Perform localization
-    result = localizer.localize(node_attention, node_names, None)
-    
-    # Print report
-    report = localizer.format_report(result)
-    print(report)
