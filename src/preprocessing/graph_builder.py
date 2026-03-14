@@ -26,19 +26,20 @@ import networkx as nx
 
 logger = logging.getLogger(__name__)
 
-
+SENSITIVE_CATEGORIES = [
+    "NETWORK", "SMS", "PHONE", "LOCATION", "CAMERA",
+    "MICROPHONE", "CONTACTS", "STORAGE", "SYSTEM", "CRYPTO",
+]
 
 
 class APICallGraphBuilder:
-    def __init__(self, api_filter, reports_dir="data/reports", viz_dir="data/graphs"):
+    def __init__(self, api_filter, reports_dir="data/graphs/intermediate/reports", viz_dir="data/graphs/intermediate/viz"):
         self.api_filter = api_filter
         self.reports_dir = Path(reports_dir)
         self.viz_dir = Path(viz_dir)
 
-
         self.reports_dir.mkdir(parents=True, exist_ok=True)
         self.viz_dir.mkdir(parents=True, exist_ok=True)
-
 
 
 
@@ -76,26 +77,26 @@ class APICallGraphBuilder:
         method_calls = decompiled_data.get("method_calls", {}) or {}
         filtered = decompiled_data.get("filtered_apis") or decompiled_data.get("filtered_data") or {}
 
-
+        # Guard: warn loudly if api_calls looks unfiltered ─────────
+        total_api_calls = sum(len(v) for v in api_calls.values() if v)
+        if total_api_calls > 5000:
+            logger.warning(
+                f"[{apk_name}] api_calls has {total_api_calls} entries — looks unfiltered. "
+                "Did you replace decompiled['api_calls'] = filtered['methods'] "
+                "before calling build_graph()? Node features will be uninformative if not."
+            )
         logger.info(f"[{apk_name}] Building graph: methods={len(methods)}, classes={len(classes)}")
 
 
+        # Graph Construction
         # 1) Add method nodes
         self._add_method_nodes(graph, methods, api_calls)
 
+        # 2) Always add ALL API nodes (Experiment 2)
+        self._add_api_nodes(graph, api_calls)
 
-        # 2) Add API nodes (prefer filtered data)
-        if filtered and filtered.get("api_stats"):
-            self._add_api_nodes_from_filtered(graph, filtered)
-        else:
-            self._add_api_nodes(graph, api_calls)
-
-
-        # 3) Add method -> api edges
-        if filtered and filtered.get("methods"):
-            self._add_call_edges_from_filtered(graph, filtered)
-        else:
-            self._add_call_edges(graph, api_calls)
+        # 3) Always add ALL method -> api edges
+        self._add_call_edges(graph, api_calls)     
 
 
         # 4) Add method -> method edges (prefer method_calls from decompiler)
@@ -115,7 +116,10 @@ class APICallGraphBuilder:
 
         # 7) prune to sensitive neighborhood
         pruned = self._prune_graph(graph)
-        # 8) write small debug report
+
+
+
+        # 8) Report Generation
         try:
             rpt = self.get_graph_statistics(pruned)
             rpt.update({
@@ -129,70 +133,131 @@ class APICallGraphBuilder:
         except Exception:
             logger.debug(f"[{apk_name}] failed to write report", exc_info=True)
 
-
+            
         logger.info(f"[{apk_name}] Graph built: nodes={pruned.number_of_nodes()} edges={pruned.number_of_edges()}")
         return pruned
    
-    def _visualize_graph(self, graph: nx.DiGraph, apk_name: str):
+    def _add_structural_features(self, graph: nx.DiGraph) -> None:
+        if graph.number_of_nodes() == 0:
+            return
 
+        try:
+            pagerank = nx.pagerank(graph)
+            betweenness = nx.betweenness_centrality(graph)
+
+            for node in graph.nodes():
+                graph.nodes[node]["pagerank"] = pagerank.get(node, 0.0)
+                graph.nodes[node]["betweenness"] = betweenness.get(node, 0.0)
+
+        except Exception:
+            logger.debug("Failed computing structural features", exc_info=True)
+   
+    def _visualize_graph(self, graph: nx.DiGraph, apk_name: str):
 
         if graph.number_of_nodes() == 0:
             logger.warning("Empty graph — skipping visualization")
             return
 
+        plt.figure(figsize=(14, 12))
 
-        plt.figure(figsize=(12, 10))
-
-
-        pos = nx.spring_layout(graph, k=0.8, seed=42)
-
-
-        colors = []
-        for n, d in graph.nodes(data=True):
-            if d["type"] == "api":
-                colors.append("red")
-            elif d["type"] == "reflection":
-                colors.append("orange")
-            else:
-                colors.append("skyblue")
-
-
-        nx.draw(
+        pos = nx.spring_layout(
             graph,
-            pos,
-            node_color=colors,
-            node_size=120,
-            edge_color="gray",
-            with_labels=False,
-            alpha=0.85
+            k=1.2,
+            iterations=80,
+            seed=42
         )
 
+        node_colors = []
+        node_sizes = []
 
-        plt.title(f"Sensitive API Call Graph: {apk_name}")
+        for _, d in graph.nodes(data=True):
+            t = d.get("type")
+
+            if t == "api":
+                node_colors.append("crimson")
+                node_sizes.append(450)
+
+            elif t == "reflection":
+                node_colors.append("darkorange")
+                node_sizes.append(350)
+
+            else:  # method
+                sens = d.get("sensitive_api_count", 0)
+                node_colors.append("steelblue")
+                node_sizes.append(180 + sens * 90)
+
+        nx.draw_networkx_edges(
+            graph,
+            pos,
+            alpha=0.35,
+            width=0.7
+        )
+
+        nx.draw_networkx_nodes(
+            graph,
+            pos,
+            node_color=node_colors,
+            node_size=node_sizes
+        )
+
+        # Label only APIs (otherwise clutter explosion)
+        api_labels = {
+            n: n.split("->")[-1]
+            for n, d in graph.nodes(data=True)
+            if d.get("type") == "api"
+        }
+
+        nx.draw_networkx_labels(
+            graph,
+            pos,
+            labels=api_labels,
+            font_size=7
+        )
+
+        plt.title(f"Sensitive API Interaction Graph: {apk_name}")
+        plt.axis("off")
         plt.tight_layout()
-
 
         out = self.viz_dir / f"{apk_name}_graph.png"
         plt.savefig(out, dpi=300)
         plt.close()
 
-
         logger.info(f"Graph visualization saved → {out}")
 
 
 
-
-   
     # -------------------------------------------------------------------------
     # Node helpers
     # -------------------------------------------------------------------------
-    def _add_method_nodes(self, graph: nx.DiGraph, methods: List[Dict[str, Any]], api_calls: Dict[str, List[str]]) -> None:
+    def _add_method_nodes(
+        self,
+        graph: nx.DiGraph,
+        methods: List[Dict[str, Any]],
+        api_calls: Dict[str, List[str]],
+    ) -> None:
         for m in methods:
             name = m.get("name")
             if not name:
                 continue
-            apis = api_calls.get(name, []) or []
-            sens_count = sum(1 for a in apis if self.api_filter.is_sensitive(a))
+
+            apis       = api_calls.get(name, []) or []
+            sens_count = 0
+            category_counts: Dict[str, int] = defaultdict(int)
+
+            for api in apis:
+                if self.api_filter.is_sensitive(api):
+                    sens_count += 1
+                    cat = self.api_filter.get_category_matched(api)
+                    if cat in SENSITIVE_CATEGORIES:
+                        category_counts[cat] += 1
+
+            # ── Obfuscation signals (consumed by graph_dataset.py Group 6) ──
+            short_name = name.split("->")[-1].split("(")[0] if "->" in name else name
+            cls_part   = name.split("->")[0].rstrip(";").split("/")[-1].split("$")[0] if "->" in name else ""
+
+            is_obf_method = bool(short_name) and len(short_name) <= 2 and short_name.isalpha()
+            is_obf_class  = bool(cls_part)   and len(cls_part)  <= 2 and cls_part.isalpha()
+
             graph.add_node(
                 name,
                 type="method",
@@ -202,43 +267,48 @@ class APICallGraphBuilder:
                 dex=m.get("dex"),
                 api_count=len(apis),
                 sensitive_api_count=sens_count,
-                has_sensitive_api=(sens_count > 0)
+                has_sensitive_api=(sens_count > 0),
+                is_sensitive=(sens_count > 0),
+                category=max(category_counts, key=category_counts.get) if category_counts else "UNKNOWN",
+                category_counts=dict(category_counts),
+                is_obf_method=is_obf_method,
+                is_obf_class=is_obf_class,
+                pagerank=0.0,
+                betweenness=0.0,
             )
 
 
     def _add_api_nodes(self, graph: nx.DiGraph, api_calls: Dict[str, List[str]]) -> None:
-        all_apis = set()
-        for lst in api_calls.values():
-            if lst:
-                all_apis.update(lst)
-        for api in all_apis:
-            if not self.api_filter.is_sensitive(api):
-                continue
-            # prefer using create_api_features if extractor provides it
-            try:
-                features = self.api_filter.create_api_features(api)
-                category = features.get("category", "UNKNOWN")
-                category_id = features.get("category_id", -1)
-            except AttributeError:
-                # fallback: try a mapping or use stable hash
-                if hasattr(self.api_filter, "api_to_category"):
-                    category = self.api_filter.api_to_category.get(api, "UNKNOWN")
-                else:
-                    category = "UNKNOWN"
-                category_id = abs(hash(category)) % 10000
-
-
-            graph.add_node(
-                api,
-                type="api",
-                is_sensitive=True,
-                category=category,
-                category_id=category_id,
-                class_name=api.split("->")[0] if "->" in api else "",
-                api_count=0,
-                sensitive_api_count=0
-            )
-
+        """Add a node for every unique API signature found in api_calls.
+        Must run before _add_call_edges() so 'if api in graph' checks succeed.
+        """
+        seen: set = set()
+        for apis in (api_calls or {}).values():
+            for api in (apis or []):
+                if api in seen:
+                    continue
+                seen.add(api)
+                is_sens = self.api_filter.is_sensitive(api)
+                category = self.api_filter.get_category_matched(api) if is_sens else "UNKNOWN"
+                category_id = (
+                    self.api_filter.get_category_id(category)
+                    if hasattr(self.api_filter, "get_category_id")
+                    else abs(hash(category)) % 10000
+                )
+                graph.add_node(
+                    api,
+                    type="api",
+                    is_sensitive=is_sens,
+                    category=category,
+                    category_id=category_id,
+                    class_name=api.split("->")[0] if "->" in api else "",
+                    api_count=0,
+                    sensitive_api_count=0,
+                    has_sensitive_api=is_sens,
+                    category_counts={},
+                    is_obf_method=False,
+                    is_obf_class=False,
+                )
 
     def _add_api_nodes_from_filtered(self, graph: nx.DiGraph, filtered: Dict[str, Any]) -> None:
         api_stats = filtered.get("api_stats", {}) or {}
@@ -254,11 +324,11 @@ class APICallGraphBuilder:
                 category_id=category_id,
                 class_name=api.split("->")[0] if "->" in api else "",
                 api_count=0,
-                sensitive_api_count=0
+                sensitive_api_count=0,
+                category_counts={}
             )
 
-
-    # -------------------------------------------------------------------------
+      # -------------------------------------------------------------------------
     # Edges: method -> api
     # -------------------------------------------------------------------------
     def _add_call_edges(self, graph: nx.DiGraph, api_calls: Dict[str, List[str]]) -> None:
@@ -267,11 +337,20 @@ class APICallGraphBuilder:
                 continue
             for api in (lst or []):
                 if api in graph:
-                    graph.add_edge(caller, api, call_type="direct", is_sensitive_call=self.api_filter.is_sensitive(api))
-                    # update method meta
+                    is_sens = self.api_filter.is_sensitive(api)
+                    graph.add_edge(
+                        caller, api,
+                        call_type="direct",
+                        is_sensitive_call=is_sens,
+                    )
+                    # update method meta counts on edges (already set in _add_method_nodes
+                    # from the api_calls dict; this keeps them consistent if the edge
+                    # set differs from the node-creation api_calls view)
                     graph.nodes[caller]["api_count"] = graph.nodes[caller].get("api_count", 0) + 1
-                    if self.api_filter.is_sensitive(api):
-                        graph.nodes[caller]["sensitive_api_count"] = graph.nodes[caller].get("sensitive_api_count", 0) + 1
+                    if is_sens:
+                        graph.nodes[caller]["sensitive_api_count"] = (
+                            graph.nodes[caller].get("sensitive_api_count", 0) + 1
+                        )
                         graph.nodes[caller]["has_sensitive_api"] = True
 
 
@@ -284,14 +363,18 @@ class APICallGraphBuilder:
                 if api in graph:
                     graph.add_edge(method, api, call_type="direct", is_sensitive_call=True)
                     graph.nodes[method]["api_count"] = graph.nodes[method].get("api_count", 0) + 1
-                    graph.nodes[method]["sensitive_api_count"] = graph.nodes[method].get("sensitive_api_count", 0) + 1
+                    graph.nodes[method]["sensitive_api_count"] = (
+                        graph.nodes[method].get("sensitive_api_count", 0) + 1
+                    )
                     graph.nodes[method]["has_sensitive_api"] = True
 
 
     # -------------------------------------------------------------------------
-    # Method->method edges: prefer real method_calls from decompiler
+    # Method->method edges
     # -------------------------------------------------------------------------
-    def _add_method_to_method_edges_from_decompiler(self, graph: nx.DiGraph, method_calls: Dict[str, List[str]]) -> None:
+    def _add_method_to_method_edges_from_decompiler(
+        self, graph: nx.DiGraph, method_calls: Dict[str, List[str]]
+    ) -> None:
         for caller, callees in (method_calls or {}).items():
             if caller not in graph:
                 continue
@@ -300,21 +383,19 @@ class APICallGraphBuilder:
                     graph.add_edge(caller, callee, call_type="method_call", is_sensitive_call=False)
 
 
-    def _add_method_to_method_edges_heuristic(self, graph: nx.DiGraph, api_calls: Dict[str, List[str]]) -> None:
-        # build class -> methods
-        class_map = defaultdict(list)
+    def _add_method_to_method_edges_heuristic(
+        self, graph: nx.DiGraph, api_calls: Dict[str, List[str]]
+    ) -> None:
+        class_map: Dict[str, List[str]] = defaultdict(list)
         for node, data in graph.nodes(data=True):
             if data.get("type") == "method":
                 class_map[data.get("class_name", "")].append(node)
 
-
-        # connect methods in small classes conservatively
         for cls, methods in class_map.items():
             if not methods or len(methods) > 40:
                 continue
             for i in range(len(methods) - 1):
-                m1, m2 = methods[i], methods[i+1]
-                # connect only if they share at least one sensitive API successor
+                m1, m2 = methods[i], methods[i + 1]
                 succ1 = {n for n in graph.successors(m1) if graph.nodes[n].get("type") == "api"}
                 succ2 = {n for n in graph.successors(m2) if graph.nodes[n].get("type") == "api"}
                 if succ1 and succ2 and (succ1 & succ2):
@@ -324,27 +405,51 @@ class APICallGraphBuilder:
     # -------------------------------------------------------------------------
     # Reflection handling
     # -------------------------------------------------------------------------
-    def _add_reflection_nodes_and_edges(self, graph: nx.DiGraph, reflection: Dict[str, List[str]]) -> None:
+    def _add_reflection_nodes_and_edges(
+        self, graph: nx.DiGraph, reflection: Dict[str, List[str]]
+    ) -> None:
         for method, notes in (reflection or {}).items():
             if method not in graph:
-                # defensive: add missing method node
-                graph.add_node(method, type="method", class_name="", access_flags=None, code_size=0, api_count=0, sensitive_api_count=0, has_sensitive_api=False)
+                graph.add_node(
+                    method,
+                    type="method", class_name="", access_flags=None,
+                    code_size=0, api_count=0, sensitive_api_count=0,
+                    has_sensitive_api=False, is_sensitive=False,
+                    category="UNKNOWN", category_counts={},
+                    is_obf_method=False, is_obf_class=False,
+                    pagerank=0.0, betweenness=0.0,
+                )
             for i, note in enumerate(notes):
-                safe_note = note.replace("/", "_").replace(" ", "_").replace("'", "").replace('"', '')
+                safe_note = (
+                    note.replace("/", "_").replace(" ", "_")
+                        .replace("'", "").replace('"', "")
+                )
                 node_name = f"REFLECTION::{method}::{i}::{safe_note}"
-                graph.add_node(node_name, type="reflection", is_sensitive=True, category="reflection", category_id=-1, note=note)
+                graph.add_node(
+                    node_name,
+                    type="reflection", is_sensitive=True,
+                    category="reflection", category_id=-1, note=note,
+                    category_counts={},
+                    has_sensitive_api=True,
+                    is_obf_method=False, is_obf_class=False,
+                )
                 graph.add_edge(method, node_name, call_type="reflection", is_sensitive_call=True)
-                # attempt to connect reflection node to API nodes if note includes class info
                 try:
                     if "class='" in note:
-                        cls = note.split("class='", 1)[1].split("'", 1)[0]
+                        cls    = note.split("class='", 1)[1].split("'", 1)[0]
                         dalvik = "L" + cls.replace(".", "/") + ";"
-                        # connect to API nodes with matching class_name suffix
                         for n, d in graph.nodes(data=True):
                             if d.get("type") == "api":
                                 api_cls = d.get("class_name", "")
-                                if api_cls and (api_cls == dalvik or api_cls.endswith(dalvik.split("/")[-1] + ";")):
-                                    graph.add_edge(node_name, n, call_type="reflects_to_api", is_sensitive_call=True)
+                                if api_cls and (
+                                    api_cls == dalvik
+                                    or api_cls.endswith(dalvik.split("/")[-1] + ";")
+                                ):
+                                    graph.add_edge(
+                                        node_name, n,
+                                        call_type="reflects_to_api",
+                                        is_sensitive_call=True,
+                                    )
                 except Exception:
                     continue
 
@@ -411,6 +516,3 @@ class APICallGraphBuilder:
             "num_components": nx.number_weakly_connected_components(graph) if graph.number_of_nodes() > 0 else 0
         }
         return stats
-
-
-
