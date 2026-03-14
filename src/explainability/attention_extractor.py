@@ -33,7 +33,8 @@ class AttentionExtractor:
         self,
         x: torch.Tensor,
         edge_index: torch.Tensor,
-        batch: torch.Tensor
+        batch: torch.Tensor,
+        graph_size: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
         """
         Extract attention scores from GAT model.
@@ -42,6 +43,8 @@ class AttentionExtractor:
             x: Node features [num_nodes, num_features]
             edge_index: Edge connectivity [2, num_edges]
             batch: Batch assignment [num_nodes]
+            graph_size: Graph-level size features [batch_size, 2] (log1p nodes/edges).
+                        Required when the GAT was trained with use_graph_size=True.
             
         Returns:
             Dictionary containing:
@@ -53,9 +56,11 @@ class AttentionExtractor:
         self.model.eval()
         
         with torch.no_grad():
-            # Forward pass with attention extraction
+            # FIX: forward graph_size so gat_model.forward() receives the
+            # same size features it was trained with. Without this the FC head
+            # sees a truncated input and crashes with a shape mismatch error.
             _, attention_dict = self.model(
-                x, edge_index, batch, return_attention=True
+                x, edge_index, batch, graph_size=graph_size, return_attention=True
             )
             
             # Get attention from both layers
@@ -388,43 +393,3 @@ class AttentionExtractor:
         
         return stats
 
-
-# Example usage
-if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-    
-    # Test with dummy data
-    from src.models.gat_model import GAT
-    
-    model = GAT(num_node_features=15, hidden_units=8, num_heads=8)
-    extractor = AttentionExtractor(model, device="cpu")
-    
-    # Create dummy graph
-    num_nodes = 50
-    num_edges = 100
-    
-    x = torch.randn(num_nodes, 15)
-    edge_index = torch.randint(0, num_nodes, (2, num_edges))
-    batch = torch.zeros(num_nodes, dtype=torch.long)
-    
-    # Extract attention
-    attention = extractor.extract_gat_attention(x, edge_index, batch)
-    
-    print("Attention Extraction Results:")
-    print(f"  Node attention shape: {attention['node_attention'].shape}")
-    print(f"  Node attention stats: {extractor.get_attention_statistics(attention['node_attention'])}")
-    
-    # Create node names
-    node_names = [f"method_{i}" for i in range(num_nodes)]
-    
-    # Get top-k nodes
-    top_nodes = extractor.extract_top_k_nodes(
-        attention['node_attention'], node_names, k=5
-    )
-    
-    print("\nTop 5 Important Nodes:")
-    for node, score in top_nodes:
-        print(f"  {node}: {score:.6f}")
