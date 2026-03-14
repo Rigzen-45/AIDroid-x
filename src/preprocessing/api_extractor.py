@@ -11,7 +11,6 @@ import json
 import logging
 from pathlib import Path
 from typing import Dict, List, Set, Tuple, Optional, Any
-import math
 
 
 logger = logging.getLogger(__name__)
@@ -294,7 +293,14 @@ class SensitiveAPIFilter:
                 "total_filtered": int
             }
         """
-        # Accept either data structure
+        # Accept either data structure:
+        #   1) Full decompiler result dict (has 'methods' + 'api_calls' keys)
+        #      → used by preprocess_apks.py; includes reflection_evidence
+        #   2) Plain {method: [api_sig, ...]} dict
+        #      → used by inference.py when it passes decompiled['api_calls']
+        #         directly.  Reflection evidence is ALSO present on the full
+        #         decompiler dict, so callers that want reflection hits should
+        #         pass the full dict (or pass reflection_evidence separately).
         method_api_calls: Dict[str, List[str]] = {}
         reflection_map: Dict[str, List[str]] = {}
         # If a decompiler result dict
@@ -303,8 +309,16 @@ class SensitiveAPIFilter:
             # input_data["api_calls"] is method->list, reflection_evidence maybe present
             method_api_calls = input_data.get("api_calls", {}) or {}
             reflection_map = input_data.get("reflection_evidence", {}) or {}
+        elif isinstance(input_data, dict) and "api_calls" in input_data and "reflection_evidence" in input_data:
+            # FIX: inference.py passes decompiled['api_calls'] but decompiled also
+            # has reflection_evidence.  If the caller passes the full decompiled dict
+            # but it lacks the 'methods' list key (shouldn't happen but be safe),
+            # still extract both api_calls and reflection_evidence so reflection
+            # signal is not silently dropped.
+            method_api_calls = input_data.get("api_calls", {}) or {}
+            reflection_map = input_data.get("reflection_evidence", {}) or {}
         else:
-            # assume a plain mapping was passed
+            # plain {method: [calls]} mapping — no reflection context available
             method_api_calls = input_data or {}
 
 
@@ -381,6 +395,25 @@ class SensitiveAPIFilter:
         norm = self._normalize_sig(api_call)
         return self.api_to_category.get(norm, "UNKNOWN")
 
+    def get_category_matched(self, api_call: str) -> str:
+        """
+        Like get_category() but uses the same layered matching as is_sensitive().
+
+        get_category() only does exact lookup — returns UNKNOWN for APIs that
+        matched via class-level or fuzzy method matching (layers 2 and 3).
+        This method follows all three layers so the category is consistent
+        with what is_sensitive() decided.
+
+        Use this in graph_builder._add_method_nodes() instead of get_category().
+        """
+        matched = self._match_exact(api_call)
+        if not matched:
+            matched = self._match_class_level(api_call)
+        if not matched:
+            matched = self._match_method_only(api_call)
+        if matched:
+            return self.api_to_category.get(matched, "UNKNOWN")
+        return "UNKNOWN"
 
     def get_category_id(self, category: str) -> int:
         return self.category_to_id.get(category, -1)
@@ -397,4 +430,3 @@ class SensitiveAPIFilter:
         api_list = [(api, stats["count"], stats["category"]) for api, stats in filtered_data.get("api_stats", {}).items()]
         api_list.sort(key=lambda x: x[1], reverse=True)
         return api_list[:top_k]
-
