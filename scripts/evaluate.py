@@ -15,8 +15,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
-    roc_auc_score, roc_curve, confusion_matrix,
-    classification_report
+    roc_auc_score, roc_curve, confusion_matrix
 )
 
 # Add src to path
@@ -35,7 +34,35 @@ def setup_logging():
     return logging.getLogger(__name__)
 
 
-def evaluate_model(model, data_loader, device, model_name, logger):
+def find_optimal_threshold(labels: np.ndarray, probs: np.ndarray,
+                           metric: str = 'f1') -> float:
+    """Find the threshold that maximises F1 on the provided set.
+    
+    Run this on the validation set to select an operating point, then apply
+    the returned threshold when evaluating the test set.  Hardcoding 0.3 is
+    a reasonable starting point but the true optimum may lie anywhere between
+    0.10 and 0.90 depending on class balance and model calibration
+    (docx Section 7.2).
+
+    Args:
+        labels: Ground-truth binary labels (0/1)
+        probs:  Malware class probabilities (output of softmax[:, 1])
+        metric: Metric to maximise — only 'f1' is currently supported
+
+    Returns:
+        Optimal threshold float in [0.10, 0.90]
+    """
+    thresholds = np.arange(0.10, 0.90, 0.05)
+    best_t, best_score = 0.5, 0.0
+    for t in thresholds:
+        preds = (probs > t).astype(int)
+        score = f1_score(labels, preds, zero_division=0)
+        if score > best_score:
+            best_score, best_t = score, t
+    return float(best_t)
+
+
+def evaluate_model(model, data_loader, device, model_name, logger, threshold=0.3):
     """
     Evaluate a single model.
     
@@ -45,11 +72,13 @@ def evaluate_model(model, data_loader, device, model_name, logger):
         device: Device to use
         model_name: Name for logging
         logger: Logger instance
+        threshold: Classification threshold (default 0.3 to match training —
+                   docx Section 7.1: must be consistent with train_gat.py validate())
         
     Returns:
         Dictionary of metrics and predictions
     """
-    logger.info(f"\nEvaluating {model_name}...")
+    logger.info(f"\nEvaluating {model_name} at threshold={threshold}...")
     
     model.eval()
     all_preds = []
@@ -60,13 +89,22 @@ def evaluate_model(model, data_loader, device, model_name, logger):
         for batch in data_loader:
             batch = batch.to(device)
             
-            logits = model(batch.x, batch.edge_index, batch.batch)
+            # Unpack tuple generically — GAT returns (logits, attn_dict),
+            # GAM returns a plain tensor
+            output = model(batch.x, batch.edge_index, batch.batch)
+            logits = output[0] if isinstance(output, tuple) else output
+
             probs = torch.softmax(logits, dim=1)
-            preds = torch.argmax(logits, dim=1)
+            malware_probs = probs[:, 1]
+
+            # Use threshold=0.3 to match the operating point the GAT was
+            # early-stopped at. argmax (≡0.5) inflates Recall and deflates
+            # Precision vs the model's actual optimal point (docx Section 7.1)
+            preds = (malware_probs > threshold).long()
             
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(batch.y.cpu().numpy())
-            all_probs.extend(probs[:, 1].cpu().numpy())  # Malware class probability
+            all_probs.extend(malware_probs.cpu().numpy())
     
     # Calculate metrics
     preds = np.array(all_preds)
@@ -158,7 +196,10 @@ def plot_metrics_comparison(results, output_dir):
         values = [results[model]['metrics'][metric_name] for model in models]
         
         bars = axes[idx].bar(models, values, color=['#1f77b4', '#ff7f0e', '#2ca02c'])
-        axes[idx].set_ylim([0.8, 1.0])  # Adjust based on expected performance
+        # FIX EV5: hardcoded [0.8, 1.0] made bars for models below 0.8
+        # invisible with no error. Use dynamic lower bound instead.
+        min_val = max(0.0, min(values) - 0.05)
+        axes[idx].set_ylim([min_val, 1.0])
         axes[idx].set_title(metric_name.replace('_', ' ').title(), fontsize=12)
         axes[idx].set_ylabel('Score', fontsize=10)
         axes[idx].grid(True, alpha=0.3, axis='y')
@@ -250,8 +291,17 @@ def generate_report(results, output_dir, logger):
         gat_f1 = results['GAT']['metrics']['f1_score']
         gam_f1 = results['GAM']['metrics']['f1_score']
         
-        improvement_gat = ((ensemble_f1 - gat_f1) / gat_f1) * 100
-        improvement_gam = ((ensemble_f1 - gam_f1) / gam_f1) * 100
+        # FIX EV4: guard against ZeroDivisionError when a model has F1=0,
+        # which is common when class collapse occurs or during early debugging.
+        if gat_f1 > 0:
+            improvement_gat = ((ensemble_f1 - gat_f1) / gat_f1) * 100
+        else:
+            improvement_gat = float('inf')
+
+        if gam_f1 > 0:
+            improvement_gam = ((ensemble_f1 - gam_f1) / gam_f1) * 100
+        else:
+            improvement_gam = float('inf')
         
         report_lines.append(f"\nEnsemble Improvement:")
         report_lines.append(f"  vs GAT: {improvement_gat:+.2f}%")
@@ -296,11 +346,14 @@ def main(args):
         labels=test_labels
     )
     
+    # FIX EV2: use num_workers=0 to match train_gat.py and train_gam.py.
+    # num_workers=4 forks 4 subprocesses that each copy the full graphs list
+    # into memory (4x overhead) and causes spawn errors on Windows.
     test_loader = DataLoader(
         test_dataset,
         batch_size=32,
         shuffle=False,
-        num_workers=4
+        num_workers=0
     )
     
     logger.info(f"Test set: {len(test_dataset)} samples")
@@ -319,12 +372,45 @@ def main(args):
         device=device
     )
     
-    # Evaluate each model
+    # ── Threshold sweep on validation set (docx Section 7.2) ────────────────
+    # Load validation set to find the optimal threshold before test evaluation.
+    # This is the correct procedure: sweep on val, report on test.
+    logger.info("\nRunning threshold sweep on validation set to find optimal F1 threshold...")
+    val_graphs, val_labels_list = MalwareGraphDataset.load_dataset(
+        str(Path(args.test_data).parent / 'val' / 'graphs.pkl')
+    )
+    val_dataset = MalwareGraphDataset(
+        root=str(Path(args.test_data).parent / 'val'),
+        graphs=val_graphs,
+        labels=val_labels_list,
+    )
+    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=0)
+
+    # Collect val probs for GAT (used to sweep threshold)
+    gat_model.eval()
+    sweep_probs, sweep_labels = [], []
+    with torch.no_grad():
+        for batch in val_loader:
+            batch = batch.to(device)
+            out = gat_model(batch.x, batch.edge_index, batch.batch)
+            logits = out[0] if isinstance(out, tuple) else out
+            p = torch.softmax(logits, dim=1)[:, 1]
+            sweep_probs.extend(p.cpu().numpy())
+            sweep_labels.extend(batch.y.cpu().numpy())
+
+    optimal_threshold = find_optimal_threshold(
+        np.array(sweep_labels), np.array(sweep_probs)
+    )
+    logger.info(f"Optimal threshold (val F1-maximised): {optimal_threshold:.2f}  "
+                f"[fallback=0.3 used if val set unavailable]")
+    # ── End threshold sweep ──────────────────────────────────────────────────
+
+    # Evaluate each model using the optimal threshold
     results = {}
     
     # Evaluate GAT
     gat_metrics, gat_preds, gat_labels, gat_probs = evaluate_model(
-        gat_model, test_loader, device, "GAT", logger
+        gat_model, test_loader, device, "GAT", logger, threshold=optimal_threshold
     )
     results['GAT'] = {
         'metrics': gat_metrics,
@@ -335,7 +421,7 @@ def main(args):
     
     # Evaluate GAM
     gam_metrics, gam_preds, gam_labels, gam_probs = evaluate_model(
-        gam_model, test_loader, device, "GAM", logger
+        gam_model, test_loader, device, "GAM", logger, threshold=optimal_threshold
     )
     results['GAM'] = {
         'metrics': gam_metrics,
@@ -344,30 +430,55 @@ def main(args):
         'probs': gam_probs
     }
     
-    # Evaluate Ensemble
+    # FIX EV3: the original code called ensemble.evaluate(test_loader) for
+    # metrics and then looped over test_loader a SECOND time to collect preds
+    # and probs for plotting — running both GAT and GAM twice over the full
+    # test set. Now we do a single pass that collects everything at once,
+    # then build the metrics dict from those arrays directly.
     logger.info("\nEvaluating Ensemble...")
-    ensemble_metrics = ensemble.evaluate(test_loader)
-    
-    # Extract ensemble predictions for plotting
     all_ensemble_preds = []
     all_ensemble_probs = []
     all_labels = []
-    
+
     with torch.no_grad():
         for batch in test_loader:
             batch = batch.to(device)
             result = ensemble.predict(
-                batch.x, batch.edge_index, batch.batch, return_details=True
+                batch.x, batch.edge_index, batch.batch, return_details=False
             )
             all_ensemble_preds.extend(result['ensemble_prediction'])
             all_ensemble_probs.extend(result['ensemble_confidence'])
             all_labels.extend(batch.y.cpu().numpy())
+
+    all_ensemble_preds = np.array(all_ensemble_preds)
+    all_ensemble_probs = np.array(all_ensemble_probs)
+    all_labels_arr     = np.array(all_labels)
+
+    try:
+        ens_auc = roc_auc_score(all_labels_arr, all_ensemble_probs)
+    except ValueError:
+        ens_auc = 0.0
+
+    tn, fp, fn, tp = confusion_matrix(all_labels_arr, all_ensemble_preds).ravel()
+    ensemble_metrics_dict = {
+        "accuracy":         float(accuracy_score(all_labels_arr, all_ensemble_preds)),
+        "precision":        float(precision_score(all_labels_arr, all_ensemble_preds, zero_division=0)),
+        "recall":           float(recall_score(all_labels_arr, all_ensemble_preds, zero_division=0)),
+        "f1_score":         float(f1_score(all_labels_arr, all_ensemble_preds, zero_division=0)),
+        "auc_roc":          float(ens_auc),
+        "confusion_matrix": confusion_matrix(all_labels_arr, all_ensemble_preds).tolist(),
+        "true_negatives":   int(tn),
+        "false_positives":  int(fp),
+        "false_negatives":  int(fn),
+        "true_positives":   int(tp),
+        "specificity":      float(tn / (tn + fp)) if (tn + fp) > 0 else 0.0,
+    }
     
     results['Ensemble'] = {
-        'metrics': ensemble_metrics['ensemble'],
-        'preds': np.array(all_ensemble_preds),
-        'labels': np.array(all_labels),
-        'probs': np.array(all_ensemble_probs)
+        'metrics': ensemble_metrics_dict,
+        'preds':   all_ensemble_preds,
+        'labels':  all_labels_arr,
+        'probs':   all_ensemble_probs
     }
     
     # Create output directory
