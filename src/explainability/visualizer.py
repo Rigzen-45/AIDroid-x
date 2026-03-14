@@ -301,7 +301,14 @@ class GraphVisualizer:
             nodes = list(graph.nodes())
             top_nodes = [nodes[i] for i in top_k_indices if i < len(nodes)]
             graph = graph.subgraph(top_nodes).copy()
-            node_attention = node_attention[top_k_indices]
+            # FIX: build a name->score map BEFORE subsetting, then re-read scores
+            # in the order that subgraph.nodes() actually returns them.
+            # The original code indexed node_attention by top_k_indices (original
+            # graph order) and assumed subgraph.nodes() preserved that order, which
+            # NetworkX does not guarantee — causing attention scores to map to the
+            # wrong nodes in the visualization.
+            node_score_map = {nodes[i]: node_attention[i] for i in top_k_indices if i < len(nodes)}
+            node_attention = np.array([node_score_map.get(n, 0.0) for n in graph.nodes()])
         
         # Create layout
         if layout == "spring":
@@ -394,16 +401,11 @@ class GraphVisualizer:
         subgraph = graph.subgraph(subgraph_nodes).copy()
         
         # Get attention for subgraph nodes
+        # FIX: build a name->score dict once (O(n)) instead of calling
+        # node_list.index(node) for each subgraph node (O(n) per node = O(n^2) total).
         node_list = list(graph.nodes())
-        subgraph_attention = []
-        for node in subgraph.nodes():
-            if node in node_list:
-                idx = node_list.index(node)
-                subgraph_attention.append(node_attention[idx])
-            else:
-                subgraph_attention.append(0)
-        
-        subgraph_attention = np.array(subgraph_attention)
+        node_score_map = {n: node_attention[i] for i, n in enumerate(node_list)}
+        subgraph_attention = np.array([node_score_map.get(n, 0.0) for n in subgraph.nodes()])
         
         # Plot
         return self.plot_graph_with_attention(
@@ -412,6 +414,7 @@ class GraphVisualizer:
         )
 
 
+"""
 # Example usage
 if __name__ == "__main__":
     logging.basicConfig(
@@ -442,3 +445,4 @@ if __name__ == "__main__":
     )
     
     print("✅ Test visualizations created in test_viz/")
+"""
